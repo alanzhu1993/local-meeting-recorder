@@ -196,6 +196,59 @@ final class AudioTimelineMixerTests: XCTestCase {
         )
     }
 
+    func testIdentityOutputCapacityDoesNotReadPrimeInfo() throws {
+        var primeInfoReadCount = 0
+
+        let capacity = try SampleBufferConverter.outputFrameCapacity(
+            inputFrameCount: 960,
+            inputSampleRate: 48_000
+        ) {
+            primeInfoReadCount += 1
+            return (UInt64(UInt32.max), UInt64(UInt32.max))
+        }
+
+        XCTAssertEqual(capacity, 960)
+        XCTAssertEqual(primeInfoReadCount, 0)
+    }
+
+    func testResamplingOutputCapacityClampsExtremePrimeInfoBeforeNarrowing() throws {
+        var primeInfoReadCount = 0
+
+        let nearUInt32Limit = try SampleBufferConverter.outputFrameCapacity(
+            inputFrameCount: 441,
+            inputSampleRate: 24_000
+        ) {
+            primeInfoReadCount += 1
+            return (UInt64(UInt32.max), UInt64(UInt32.max))
+        }
+        let overflowingUInt64Sum = try SampleBufferConverter.outputFrameCapacity(
+            inputFrameCount: 441,
+            inputSampleRate: 24_000
+        ) {
+            primeInfoReadCount += 1
+            return (UInt64.max, 1)
+        }
+
+        XCTAssertEqual(nearUInt32Limit, 9_106)
+        XCTAssertEqual(overflowingUInt64Sum, 9_106)
+        XCTAssertEqual(primeInfoReadCount, 2)
+    }
+
+    func testOutputCapacityRejectsInputFrameCountThatCannotFitAVAudioFrameCount() {
+        var primeInfoReadCount = 0
+
+        XCTAssertThrowsError(try SampleBufferConverter.outputFrameCapacity(
+            inputFrameCount: UInt64(UInt32.max) + 1,
+            inputSampleRate: 48_000
+        ) {
+            primeInfoReadCount += 1
+            return (0, 0)
+        }) { error in
+            XCTAssertEqual((error as? RecordingFailure)?.code, .capture)
+        }
+        XCTAssertEqual(primeInfoReadCount, 0)
+    }
+
     func testFramePositionRoundsAtOutputSampleRate() {
         XCTAssertEqual(
             AudioTimeline.framePosition(

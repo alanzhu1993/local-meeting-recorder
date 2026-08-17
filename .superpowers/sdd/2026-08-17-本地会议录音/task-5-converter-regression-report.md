@@ -50,3 +50,40 @@ git diff --check: PASS
 ## 未验证项
 
 - 本修复使用贴近 ScreenCaptureKit 配置的 48 kHz stereo Float32 ASBD，但本报告没有重跑真实 ScreenCaptureKit 采集。Task 7 会将完整 converter→mixer→writer 会话测试从 44.1 kHz mono 改回 48 kHz stereo 后再验证。
+
+## Fix Round 1：确定性验证 primeInfo 容量逻辑
+
+外部审查指出：实际 48 kHz PCM 转换测试能验证结果，但旧实现的 `primeInfo` getter 返回值是随机的，单次测试可能恰好通过，因此无法确定性防止回归。这个问题成立。
+
+### 修改
+
+- 生产 `convert` 的容量计算提取为 internal static `outputFrameCapacity`；测试直接调用这一个 helper，不存在“测试一套、生产另一套”。
+- `primeInfo` 通过延迟 provider 读取。Helper 先校验 frameCount 和 sample rate；48 kHz identity 直接返回精确输入帧数，不调用 provider。
+- 非 identity 路径才读取 provider，仍执行 4096 prime-input-frame 限制、采样率换算、受检加法和 `AVAudioFrameCount.max` 限幅。
+- Helper 入参使用 `UInt64` 表示输入 frameCount，从而可以确定性测试超出 `AVAudioFrameCount.max` 的输入；该情况抛出 `.capture`，不做窄化转换，也不读取 provider。
+
+### TDD 证据
+
+RED 阶段先加测试，生产代码尚只有 private instance helper，编译失败：
+
+```text
+error: 'outputFrameCapacity' is inaccessible due to 'private' protection level
+error: extra arguments at positions #2, #3 in call
+```
+
+GREEN 阶段的确定性断言：
+
+- 48 kHz identity：`inputFrameCount=960`，provider 注入两个 `UInt32.max`；结果容量精确为 960，provider 调用次数为 0。
+- 24→48 kHz：分别注入两个 `UInt32.max` 和会让 `UInt64` 加法溢出的 `UInt64.max + 1`；两次都按 4096 prime frames 限制后返回同一有界容量 9106，没有 trap。
+- `inputFrameCount=UInt32.max+1`：抛出 `.capture`，provider 调用次数为 0。
+
+### Fix Round 1 验证
+
+```text
+AudioTimelineMixerTests: 16 tests, 0 failures
+Full swift test: 126 tests, 0 failures
+swift build -Xswiftc -warnings-as-errors: PASS
+git diff --check: PASS
+```
+
+Task 7 的完整会话链路已改为 48 kHz Float32 stereo；本轮全量测试中该 converter→mixer→fragmented writer 测试通过。仍未在本轮重跑真实 ScreenCaptureKit 采集。

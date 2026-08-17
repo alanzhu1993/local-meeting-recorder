@@ -54,7 +54,16 @@ public final class SampleBufferConverter: @unchecked Sendable {
             )
         }
         let startFrame = state.outputCursor ?? presentationFrame
-        let capacity = try outputFrameCapacity(for: input, converter: state.converter)
+        let capacity = try Self.outputFrameCapacity(
+            inputFrameCount: UInt64(input.frameLength),
+            inputSampleRate: input.format.sampleRate
+        ) {
+            let primeInfo = state.converter.primeInfo
+            return (
+                UInt64(primeInfo.leadingFrames),
+                UInt64(primeInfo.trailingFrames)
+            )
+        }
         guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
             throw RecordingFailure(code: .capture, message: "Could not allocate converted audio storage.")
         }
@@ -128,41 +137,44 @@ public final class SampleBufferConverter: @unchecked Sendable {
         return chunks
     }
 
-    private func outputFrameCapacity(
-        for input: AVAudioPCMBuffer,
-        converter: AVAudioConverter
+    static func outputFrameCapacity(
+        inputFrameCount: UInt64,
+        inputSampleRate: Double,
+        primeInfoProvider: () -> (leadingFrames: UInt64, trailingFrames: UInt64)
     ) throws -> AVAudioFrameCount {
-        let inputSampleRate = input.format.sampleRate
+        let maximumCapacity = UInt64(AVAudioFrameCount.max)
+        guard inputFrameCount > 0, inputFrameCount <= maximumCapacity else {
+            throw RecordingFailure(code: .capture, message: "Captured audio has an invalid frame count.")
+        }
         guard inputSampleRate.isFinite, inputSampleRate > 0 else {
             throw RecordingFailure(code: .capture, message: "Captured audio has an invalid sample rate.")
         }
 
         if inputSampleRate == Self.outputSampleRate {
-            return max(1, input.frameLength)
+            return AVAudioFrameCount(inputFrameCount)
         }
 
-        let maximumCapacity = UInt64(AVAudioFrameCount.max)
         let ratio = Self.outputSampleRate / inputSampleRate
-        let expectedValue = ceil(Double(input.frameLength) * ratio)
+        let expectedValue = ceil(Double(inputFrameCount) * ratio)
         guard expectedValue.isFinite, expectedValue > 0 else {
             throw RecordingFailure(code: .capture, message: "Captured audio has an invalid converted frame count.")
         }
         let expectedFrames = UInt64(min(expectedValue, Double(maximumCapacity)))
 
-        let primeInfo = converter.primeInfo
-        let reportedPrimeFrames = clampedSum(
-            UInt64(primeInfo.leadingFrames),
-            UInt64(primeInfo.trailingFrames),
+        let primeInfo = primeInfoProvider()
+        let reportedPrimeFrames = Self.clampedSum(
+            primeInfo.leadingFrames,
+            primeInfo.trailingFrames,
             upperBound: Self.maximumPrimeInputFrames
         )
         let scaledPrimeValue = ceil(Double(reportedPrimeFrames) * ratio)
         let scaledPrimeFrames = UInt64(min(scaledPrimeValue, Double(maximumCapacity)))
-        let withPrime = clampedSum(
+        let withPrime = Self.clampedSum(
             expectedFrames,
             scaledPrimeFrames,
             upperBound: maximumCapacity
         )
-        let withSafety = clampedSum(
+        let withSafety = Self.clampedSum(
             withPrime,
             Self.conversionSafetyFrames,
             upperBound: maximumCapacity
@@ -170,7 +182,7 @@ public final class SampleBufferConverter: @unchecked Sendable {
         return AVAudioFrameCount(max(1, withSafety))
     }
 
-    private func clampedSum(
+    private static func clampedSum(
         _ left: UInt64,
         _ right: UInt64,
         upperBound: UInt64
