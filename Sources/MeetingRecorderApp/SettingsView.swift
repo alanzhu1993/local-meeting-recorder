@@ -15,6 +15,7 @@ extension AppSettingsStore: SettingsPersisting {}
 final class SettingsViewModel: ObservableObject {
     @Published private(set) var settings: AppSettings
     @Published private(set) var launchAtLoginIsEnabled: Bool
+    @Published private(set) var isInteractionEnabled = true
     @Published var errorMessage: String?
 
     private let persistence: any SettingsPersisting
@@ -41,12 +42,14 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func setRecordingRoot(_ root: URL) {
+        guard isInteractionEnabled else { return }
         errorMessage = nil
         settings.recordingRoot = root
         persistence.save(settings)
     }
 
     func applyHotkey(_ descriptor: HotkeyDescriptor) {
+        guard isInteractionEnabled else { return }
         guard descriptor != settings.hotkey else { return }
         let previous = settings.hotkey
         errorMessage = nil
@@ -75,6 +78,7 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
+        guard isInteractionEnabled else { return }
         guard enabled != launchAtLoginIsEnabled else { return }
         let previousExpectation = settings.launchAtLogin
         errorMessage = nil
@@ -93,6 +97,10 @@ final class SettingsViewModel: ObservableObject {
 
     func refreshSystemState() {
         launchAtLoginIsEnabled = loginItem.isEnabled
+    }
+
+    func setLifecycleBusy(_ busy: Bool) {
+        isInteractionEnabled = !busy
     }
 
     static var preview: SettingsViewModel {
@@ -121,54 +129,68 @@ struct SettingsView: View {
                         .foregroundStyle(AppColors.ink3)
                 }
 
-                settingSection(title: "保存位置") {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(model.settings.recordingRoot.path)
-                            .font(.system(size: 12))
-                            .foregroundStyle(AppColors.ink2)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityLabel("当前保存位置：\(model.settings.recordingRoot.path)")
-                        Button("选择文件夹…", action: chooseFolder)
-                            .buttonStyle(SecondaryButtonStyle())
-                            .accessibilityLabel("选择录音保存文件夹")
-                        Text("修改后将在下次启动时生效。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(AppColors.ink3)
-                    }
+                if !model.isInteractionEnabled {
+                    Text("正在恢复上次中断的录音，恢复完成后可修改设置。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(AppColors.warningText)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(AppColors.warningSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.warningBorder, lineWidth: 1))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
 
-                settingSection(title: "快捷键") {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ShortcutRecorderView(
-                            displayText: model.settings.hotkey.displayText,
-                            onCapture: model.applyHotkey,
-                            onError: { model.errorMessage = $0 }
-                        )
-                        Text("点击后按新组合键。必须包含 Control 或 Command；按 Esc 取消。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(AppColors.ink3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-
-                settingSection(title: "启动") {
-                    Button {
-                        model.setLaunchAtLogin(!model.launchAtLoginIsEnabled)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: model.launchAtLoginIsEnabled ? "checkmark.square.fill" : "square")
-                                .foregroundStyle(model.launchAtLoginIsEnabled ? AppColors.ink : AppColors.ink3)
-                            Text("登录 Mac 时自动启动")
-                                .font(.system(size: 13))
-                                .foregroundStyle(AppColors.ink)
+                Group {
+                    settingSection(title: "保存位置") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(model.settings.recordingRoot.path)
+                                .font(.system(size: 12))
+                                .foregroundStyle(AppColors.ink2)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityLabel("当前保存位置：\(model.settings.recordingRoot.path)")
+                            Button("选择文件夹…", action: chooseFolder)
+                                .buttonStyle(SecondaryButtonStyle())
+                                .accessibilityLabel("选择录音保存文件夹")
+                            Text("修改后将在下次启动时生效。")
+                                .font(.system(size: 11))
+                                .foregroundStyle(AppColors.ink3)
                         }
                     }
-                    .buttonStyle(.plain)
-                    .focusable(true)
-                    .accessibilityLabel("登录 Mac 时自动启动会议录音")
-                    .accessibilityValue(model.launchAtLoginIsEnabled ? "已开启" : "已关闭")
+
+                    settingSection(title: "快捷键") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ShortcutRecorderView(
+                                displayText: model.settings.hotkey.displayText,
+                                onCapture: model.applyHotkey,
+                                onError: { model.errorMessage = $0 }
+                            )
+                            Text("点击后按新组合键。必须包含 Control 或 Command；按 Esc 取消。")
+                                .font(.system(size: 11))
+                                .foregroundStyle(AppColors.ink3)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    settingSection(title: "启动") {
+                        Button {
+                            model.setLaunchAtLogin(!model.launchAtLoginIsEnabled)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: model.launchAtLoginIsEnabled ? "checkmark.square.fill" : "square")
+                                    .foregroundStyle(model.launchAtLoginIsEnabled ? AppColors.ink : AppColors.ink3)
+                                Text("登录 Mac 时自动启动")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(AppColors.ink)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .focusable(true)
+                        .accessibilityLabel("登录 Mac 时自动启动会议录音")
+                        .accessibilityValue(model.launchAtLoginIsEnabled ? "已开启" : "已关闭")
+                    }
                 }
+                .disabled(!model.isInteractionEnabled)
 
                 if let errorMessage = model.errorMessage {
                     Text(errorMessage)

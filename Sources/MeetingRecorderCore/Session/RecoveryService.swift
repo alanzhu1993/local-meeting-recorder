@@ -30,6 +30,7 @@ extension M4AFinalizer: InterruptedRecordingFinalizing {}
 public actor RecoveryService {
     public private(set) var isRecovering = false
     public private(set) var lastFailure: RecordingFailure?
+    public private(set) var lastBatchFailure: RecordingFailure?
 
     private let activityGate: RecordingActivityGate
     private let store: any InterruptedRecordingStoring
@@ -82,17 +83,26 @@ public actor RecoveryService {
         let task = Task {
             do {
                 let lease = try await activityGate.acquireRecovery()
-                let results = await Self.performRecovery(store: store, finalizer: finalizer)
+                let batch = await Self.performRecovery(store: store, finalizer: finalizer)
                 await activityGate.release(lease)
-                return RecoveryOperationOutcome(results: results, failure: nil)
+                return RecoveryOperationOutcome(
+                    results: batch.results,
+                    failure: nil,
+                    batchFailure: batch.failure
+                )
             } catch {
                 let failure = Self.failure(from: error)
-                return RecoveryOperationOutcome(results: [], failure: failure)
+                return RecoveryOperationOutcome(
+                    results: [],
+                    failure: failure,
+                    batchFailure: nil
+                )
             }
         }
         inFlight = (identifier, task)
         isRecovering = true
         lastFailure = nil
+        lastBatchFailure = nil
 
         let outcome = await task.value
         await beforeCreatorCompletion()
@@ -105,17 +115,21 @@ public actor RecoveryService {
         inFlight = nil
         isRecovering = false
         lastFailure = outcome.failure
+        lastBatchFailure = outcome.batchFailure
     }
 
     private nonisolated static func performRecovery(
         store: any InterruptedRecordingStoring,
         finalizer: any InterruptedRecordingFinalizing
-    ) async -> [RecoveryResult] {
+    ) async -> RecoveryBatchOutcome {
         let interrupted: [URL]
         do {
             interrupted = try await store.listInterruptedRecordings()
         } catch {
-            return []
+            return RecoveryBatchOutcome(
+                results: [],
+                failure: recoveryFailure(from: error)
+            )
         }
 
         var seen = Set<String>()
@@ -152,7 +166,7 @@ public actor RecoveryService {
                 )))
             }
         }
-        return results
+        return RecoveryBatchOutcome(results: results, failure: nil)
     }
 
     private nonisolated static func failureMessage(_ error: Error) -> String {
@@ -164,9 +178,20 @@ public actor RecoveryService {
         if let failure = error as? RecordingFailure { return failure }
         return RecordingFailure(code: .capture, message: error.localizedDescription)
     }
+
+    private nonisolated static func recoveryFailure(from error: Error) -> RecordingFailure {
+        if let failure = error as? RecordingFailure { return failure }
+        return RecordingFailure(code: .write, message: error.localizedDescription)
+    }
 }
 
 private struct RecoveryOperationOutcome: Sendable {
+    let results: [RecoveryResult]
+    let failure: RecordingFailure?
+    let batchFailure: RecordingFailure?
+}
+
+private struct RecoveryBatchOutcome: Sendable {
     let results: [RecoveryResult]
     let failure: RecordingFailure?
 }

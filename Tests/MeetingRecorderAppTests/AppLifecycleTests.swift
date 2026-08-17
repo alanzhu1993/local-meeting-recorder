@@ -1,10 +1,36 @@
 import AppKit
-import MeetingRecorderCore
 import XCTest
+@testable import MeetingRecorderCore
 @testable import MeetingRecorderApp
 
 @MainActor
 final class AppLifecycleTests: XCTestCase {
+    func testProductionCompositionUsesOneSharedInstanceForCrossCuttingServices() {
+        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let composition = ProductionCompositionRoot(
+            settingsStore: AppSettingsStore(defaults: defaults),
+            notificationService: NotificationService(backend: CompositionNotificationBackend())
+        )
+        let action = PermissionGatedRecordingAction(
+            permissions: composition.permissions,
+            phase: { .idle },
+            toggle: {},
+            updatePermissionMessage: { _ in }
+        )
+        let entrypoint = RecordingActionEntrypoint(action: action)
+
+        let snapshot = composition.identitySnapshot(action: action, entrypoint: entrypoint)
+
+        XCTAssertEqual(snapshot.permissionForAction, snapshot.permissionForSession)
+        XCTAssertEqual(snapshot.activityGateForSession, snapshot.activityGateForRecovery)
+        XCTAssertEqual(snapshot.storeForSession, snapshot.storeForRecovery)
+        XCTAssertEqual(snapshot.notificationForSession, snapshot.notificationHeldByApp)
+        XCTAssertEqual(snapshot.buttonActionEntrypoint, snapshot.hotkeyActionEntrypoint)
+        XCTAssertEqual(snapshot.launchRecordingRoot, snapshot.storeRecordingRoot)
+    }
+
     func testLaunchRecoversBeforeEnablingHotkey() async {
         let harness = AppLifecycleHarness()
 
@@ -41,6 +67,25 @@ final class AppLifecycleTests: XCTestCase {
         )
         XCTAssertTrue(harness.recoveryMessages.contains { $0?.contains("recovered.m4a") == true })
         XCTAssertTrue(harness.recoveryMessages.contains { $0?.contains("failed.inprogress.mov") == true })
+        XCTAssertEqual(harness.feedbacks.count, 2)
+        XCTAssertTrue(harness.feedbacks.contains { $0.message.contains(failedURL.path) })
+    }
+
+    func testBatchScanFailureStaysVisibleWithRootAndErrorAfterLaunch() async {
+        let root = URL(fileURLWithPath: "/tmp/recording-root", isDirectory: true)
+        let harness = AppLifecycleHarness(
+            recoveryRoot: root,
+            recoveryError: RecordingFailure(code: .write, message: "scan denied")
+        )
+
+        await harness.lifecycle.launch()
+
+        XCTAssertFalse(harness.recoveryStates.last ?? true)
+        XCTAssertEqual(harness.feedbacks.count, 1)
+        XCTAssertTrue(harness.feedbacks[0].message.contains(root.path))
+        XCTAssertTrue(harness.feedbacks[0].message.contains("scan denied"))
+        XCTAssertEqual(harness.feedbacks[0].revealURL, root)
+        XCTAssertTrue(harness.feedbacks[0].isFailure)
     }
 
     func testStartupServiceErrorsRemainVisibleWithoutStoppingLaterSteps() async {
@@ -141,6 +186,548 @@ final class AppLifecycleTests: XCTestCase {
             )
         }
     }
+
+    func testTerminationCancelsRealLiveSessionPreparingAndKeepsWorkingFile() async throws {
+        let harness = try LiveLifecycleHarness(suspendCaptureStart: true)
+        await harness.lifecycle.launch()
+        let start = Task { await harness.coordinator.toggleRecording() }
+        await harness.capture.waitUntilStartEntered()
+        XCTAssertEqual(harness.coordinator.phase, .preparing)
+
+        let disposition = harness.lifecycle.prepareForTermination(reply: harness.reply)
+        await harness.lifecycle.waitForTermination()
+        await start.value
+        let abortCallCount = await harness.writer.abortCallCount
+        let stopCallCount = await harness.capture.stopCallCount
+
+        XCTAssertEqual(disposition, .terminateLater)
+        XCTAssertEqual(abortCallCount, 1)
+        XCTAssertEqual(stopCallCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.workingURL.path))
+        XCTAssertEqual(harness.replyCount, 1)
+    }
+
+    func testTerminationJoinsRealLiveSessionStoppingOperation() async throws {
+        let finishGate = LifecycleAsyncGate()
+        let harness = try LiveLifecycleHarness(finishGate: finishGate)
+        await harness.lifecycle.launch()
+        await harness.coordinator.toggleRecording()
+        let stop = Task { await harness.coordinator.toggleRecording() }
+        await harness.writer.waitUntilFinishEntered()
+        guard case .stopping = harness.coordinator.phase else {
+            return XCTFail("expected real coordinator to be stopping")
+        }
+
+        let disposition = harness.lifecycle.prepareForTermination(reply: harness.reply)
+        await finishGate.open()
+        await harness.lifecycle.waitForTermination()
+        await stop.value
+        let finishCallCount = await harness.writer.finishCallCount
+
+        XCTAssertEqual(disposition, .terminateLater)
+        XCTAssertEqual(finishCallCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.finalURL.path))
+        XCTAssertEqual(harness.replyCount, 1)
+    }
+
+    func testTerminationAllowsExitAfterRealLiveSessionFinishFailureKeepsWorkingFile() async throws {
+        let failure = RecordingFailure(code: .finalize, message: "finish failed")
+        let harness = try LiveLifecycleHarness(finishError: failure)
+        await harness.lifecycle.launch()
+        await harness.coordinator.toggleRecording()
+
+        let disposition = harness.lifecycle.prepareForTermination(reply: harness.reply)
+        await harness.lifecycle.waitForTermination()
+        let finishCallCount = await harness.writer.finishCallCount
+        let abortCallCount = await harness.writer.abortCallCount
+
+        XCTAssertEqual(disposition, .terminateLater)
+        XCTAssertEqual(finishCallCount, 1)
+        XCTAssertEqual(abortCallCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.workingURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.finalURL.path))
+        XCTAssertEqual(harness.replyCount, 1)
+    }
+}
+
+final class InstallScriptIntegrationTests: XCTestCase {
+    func testDittoPartialFailureRestoresPreviousAppAndPreservesFailedArtifact() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        harness.environment["MEETING_RECORDER_DITTO_TOOL"] = harness.dittoPartialFailure.path
+
+        let result = try harness.run()
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertEqual(try harness.targetMarker(), "old")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.appendingPathComponent("partial").path))
+    }
+
+    func testFirstInstallVerificationFailureMovesPartialTargetToFailedArtifact() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try Data().write(to: harness.failTargetVerificationFlag)
+
+        let result = try harness.run()
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.targetApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: harness.failedApp.appendingPathComponent("Contents/MacOS/MeetingRecorderApp").path
+        ))
+    }
+
+    func testBackupNameCollisionUsesIncrementedUniqueName() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        try FileManager.default.createDirectory(at: harness.backupApp, withIntermediateDirectories: true)
+        try Data("collision".utf8).write(to: harness.backupApp.appendingPathComponent("marker"))
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(
+            try String(contentsOf: harness.backupApp.appendingPathComponent("marker"), encoding: .utf8),
+            "collision"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: harness.backupAppV2.appendingPathComponent("marker"), encoding: .utf8),
+            "old"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.targetExecutable.path))
+    }
+
+    func testWrongProcessPathIsNeverAskedToQuit() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        try harness.setProcesses(["111": "/tmp/Other.app/Contents/MacOS/MeetingRecorderApp"])
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.quitCalledFlag.path))
+        XCTAssertEqual(
+            try String(contentsOf: harness.backupApp.appendingPathComponent("marker"), encoding: .utf8),
+            "old"
+        )
+    }
+
+    func testRestoreMoveFailureLeavesPartialTargetAndCompleteBackup() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        harness.environment["MEETING_RECORDER_DITTO_TOOL"] = harness.dittoPartialFailure.path
+        harness.environment["MEETING_RECORDER_MV_TOOL"] = harness.mvRestoreFailure.path
+
+        let result = try harness.run()
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.targetApp.appendingPathComponent("partial").path))
+        XCTAssertEqual(
+            try String(contentsOf: harness.backupApp.appendingPathComponent("marker"), encoding: .utf8),
+            "old"
+        )
+    }
+
+    func testNormalQuitTimeoutAbortsBeforeMovingExistingApp() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        try harness.setProcesses(["222": harness.targetExecutable.path])
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 68, result.output)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.quitCalledFlag.path))
+        XCTAssertEqual(try harness.targetMarker(), "old")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.backupApp.path))
+    }
+}
+
+private final class InstallScriptHarness {
+    static let stamp = "2026-08-18-010101"
+    let root: URL
+    let sourceRoot: URL
+    let installRoot: URL
+    let toolsRoot: URL
+    let stateRoot: URL
+    let sourceApp: URL
+    let targetApp: URL
+    let targetExecutable: URL
+    let backupApp: URL
+    let backupAppV2: URL
+    let failedApp: URL
+    let failTargetVerificationFlag: URL
+    let quitCalledFlag: URL
+    let dittoPartialFailure: URL
+    let mvRestoreFailure: URL
+    let installScript: URL
+    var environment: [String: String]
+
+    init() throws {
+        let makeTemp = Process()
+        let output = Pipe()
+        makeTemp.executableURL = URL(fileURLWithPath: "/usr/bin/mktemp")
+        let template = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting-recorder-install-test.XXXXXX").path
+        makeTemp.arguments = ["-d", template]
+        makeTemp.standardOutput = output
+        try makeTemp.run()
+        makeTemp.waitUntilExit()
+        guard makeTemp.terminationStatus == 0,
+              let path = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else {
+            throw InstallHarnessError.setup
+        }
+
+        let canonicalPath = path.hasPrefix("/var/") ? "/private\(path)" : path
+        root = URL(fileURLWithPath: canonicalPath, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        sourceRoot = root.appendingPathComponent("source", isDirectory: true)
+        installRoot = root.appendingPathComponent("install", isDirectory: true)
+        toolsRoot = root.appendingPathComponent("tools", isDirectory: true)
+        stateRoot = root.appendingPathComponent("state", isDirectory: true)
+        sourceApp = sourceRoot.appendingPathComponent("会议录音-2026-08-18.app", isDirectory: true)
+        targetApp = installRoot.appendingPathComponent("会议录音.app", isDirectory: true)
+        targetExecutable = targetApp.appendingPathComponent("Contents/MacOS/MeetingRecorderApp")
+        backupApp = installRoot.appendingPathComponent("会议录音-backup-\(Self.stamp).app")
+        backupAppV2 = installRoot.appendingPathComponent("会议录音-backup-\(Self.stamp)-v2.app")
+        failedApp = installRoot.appendingPathComponent("会议录音-failed-\(Self.stamp).app")
+        failTargetVerificationFlag = stateRoot.appendingPathComponent("fail-target-verification")
+        quitCalledFlag = stateRoot.appendingPathComponent("quit-called")
+        let testFile = URL(fileURLWithPath: #filePath)
+        installScript = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("scripts/install-local.sh")
+
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: installRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: toolsRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stateRoot, withIntermediateDirectories: true)
+        try Self.makeApp(at: sourceApp, marker: "new")
+
+        let codesign = toolsRoot.appendingPathComponent("codesign")
+        try Self.writeTool(codesign, """
+            #!/bin/zsh
+            app="${@: -1}"
+            if [[ -f '\(failTargetVerificationFlag.path)' && "${app:t}" == '会议录音.app' ]]; then exit 1; fi
+            exit 0
+            """)
+        let open = toolsRoot.appendingPathComponent("open")
+        try Self.writeTool(open, "#!/bin/zsh\nprint -r -- \"$1\" > '\(stateRoot.appendingPathComponent("open-called").path)'\n")
+        let quit = toolsRoot.appendingPathComponent("quit")
+        try Self.writeTool(quit, "#!/bin/zsh\n: > '\(quitCalledFlag.path)'\n")
+        let pgrep = toolsRoot.appendingPathComponent("pgrep")
+        try Self.writeTool(pgrep, "#!/bin/zsh\n[[ -f '\(stateRoot.appendingPathComponent("pids").path)' ]] && /bin/cat '\(stateRoot.appendingPathComponent("pids").path)'\nexit 0\n")
+        let ps = toolsRoot.appendingPathComponent("ps")
+        try Self.writeTool(ps, """
+            #!/bin/zsh
+            pid=""
+            for argument in "$@"; do
+                [[ "$argument" == <-> ]] && pid="$argument"
+            done
+            path='\(stateRoot.path)/path-'"$pid"
+            [[ -f "$path" ]] && /bin/cat "$path"
+            exit 0
+            """)
+        let sleep = toolsRoot.appendingPathComponent("sleep")
+        try Self.writeTool(sleep, "#!/bin/zsh\nexit 0\n")
+        dittoPartialFailure = toolsRoot.appendingPathComponent("ditto-partial-failure")
+        try Self.writeTool(dittoPartialFailure, """
+            #!/bin/zsh
+            /bin/mkdir -p "$2"
+            : > "$2/partial"
+            exit 9
+            """)
+        mvRestoreFailure = toolsRoot.appendingPathComponent("mv-restore-failure")
+        try Self.writeTool(mvRestoreFailure, """
+            #!/bin/zsh
+            if [[ "$2" == *"会议录音-failed-"* ]]; then exit 10; fi
+            /bin/mv "$1" "$2"
+            """)
+
+        environment = ProcessInfo.processInfo.environment
+        environment["MEETING_RECORDER_INSTALL_TESTING"] = "1"
+        environment["MEETING_RECORDER_TEST_ROOT"] = root.path
+        environment["MEETING_RECORDER_SOURCE_ROOT"] = sourceRoot.path
+        environment["MEETING_RECORDER_INSTALL_ROOT"] = installRoot.path
+        environment["MEETING_RECORDER_CODESIGN_TOOL"] = codesign.path
+        environment["MEETING_RECORDER_OPEN_TOOL"] = open.path
+        environment["MEETING_RECORDER_QUIT_TOOL"] = quit.path
+        environment["MEETING_RECORDER_PGREP_TOOL"] = pgrep.path
+        environment["MEETING_RECORDER_PS_TOOL"] = ps.path
+        environment["MEETING_RECORDER_SLEEP_TOOL"] = sleep.path
+        environment["MEETING_RECORDER_QUIT_ATTEMPTS"] = "1"
+        environment["MEETING_RECORDER_TEST_BACKUP_STAMP"] = Self.stamp
+
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedTarget = targetApp.resolvingSymlinksInPath().standardizedFileURL.path
+        guard resolvedTarget.hasPrefix(resolvedRoot + "/") else {
+            throw InstallHarnessError.unsafeTarget
+        }
+    }
+
+    func installOldApp(marker: String) throws {
+        try Self.makeApp(at: targetApp, marker: marker)
+    }
+
+    func targetMarker() throws -> String {
+        try String(contentsOf: targetApp.appendingPathComponent("marker"), encoding: .utf8)
+    }
+
+    func setProcesses(_ processes: [String: String]) throws {
+        let pids = processes.keys.sorted().joined(separator: "\n") + "\n"
+        try Data(pids.utf8).write(to: stateRoot.appendingPathComponent("pids"))
+        for (pid, path) in processes {
+            let canonicalPath = path.hasPrefix("/var/") ? "/private\(path)" : path
+            try Data((canonicalPath + "\n").utf8).write(to: stateRoot.appendingPathComponent("path-\(pid)"))
+        }
+    }
+
+    func run() throws -> (status: Int32, output: String) {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = installScript
+        process.arguments = ["2026-08-18"]
+        process.environment = environment
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static func makeApp(at url: URL, marker: String) throws {
+        let executable = url.appendingPathComponent("Contents/MacOS/MeetingRecorderApp")
+        try FileManager.default.createDirectory(
+            at: executable.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("#!/bin/zsh\nexit 0\n".utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+        <key>CFBundleIdentifier</key><string>com.alan.local-meeting-recorder</string>
+        <key>LSUIElement</key><true/>
+        </dict></plist>
+        """
+        try Data(plist.utf8).write(to: url.appendingPathComponent("Contents/Info.plist"))
+        try Data(marker.utf8).write(to: url.appendingPathComponent("marker"))
+    }
+
+    private static func writeTool(_ url: URL, _ source: String) throws {
+        try Data(source.utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+}
+
+private enum InstallHarnessError: Error {
+    case setup
+    case unsafeTarget
+}
+
+@MainActor
+private final class LiveLifecycleHarness {
+    let directory: URL
+    let workingURL: URL
+    let finalURL: URL
+    let capture: LifecycleCaptureSpy
+    let writer: LifecycleWriterSpy
+    let session: LiveRecordingSessionManager
+    let coordinator: RecordingCoordinator
+    let lifecycle: AppLifecycle
+    private(set) var replyCount = 0
+
+    init(
+        suspendCaptureStart: Bool = false,
+        finishGate: LifecycleAsyncGate? = nil,
+        finishError: RecordingFailure? = nil
+    ) throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        workingURL = directory.appendingPathComponent(".meeting.inprogress.mov")
+        finalURL = directory.appendingPathComponent("meeting.m4a")
+        let paths = RecordingPaths(
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            directoryURL: directory,
+            workingURL: workingURL,
+            finalURL: finalURL,
+            recoveredURL: directory.appendingPathComponent("meeting-recovered.m4a")
+        )
+        let captureGate = suspendCaptureStart ? LifecycleAsyncGate() : nil
+        let capture = LifecycleCaptureSpy(startGate: captureGate)
+        let writer = LifecycleWriterSpy(
+            workingURL: workingURL,
+            finishGate: finishGate,
+            finishError: finishError
+        )
+        let session = LiveRecordingSessionManager(
+            activityGate: RecordingActivityGate(),
+            store: LifecycleStoreSpy(paths: paths),
+            capture: capture,
+            permissions: LifecyclePermissionSpy(),
+            sleep: LifecycleSleepSpy(),
+            notifications: LifecycleNotificationSpy(),
+            writerFactory: { _ in writer },
+            converterFactory: { SampleBufferConverter() },
+            mixerFactory: {
+                AudioTimelineMixer(sampleRate: 48_000, channels: 2, chunkFrames: 960)
+            },
+            now: Date.init,
+            sampleQueueCapacity: 8
+        )
+        let coordinator = RecordingCoordinator(session: session)
+        self.capture = capture
+        self.writer = writer
+        self.session = session
+        self.coordinator = coordinator
+        lifecycle = AppLifecycle(
+            showMenu: {},
+            setRecoveryStatus: { _, _ in },
+            recoveryRoot: directory,
+            recover: { [] },
+            notifyRecoveryResult: { _ in },
+            registerHotkey: {},
+            applyLoginItemSetting: {},
+            startupError: { _ in },
+            phase: { coordinator.phase },
+            stopRecording: { await coordinator.toggleRecording() },
+            awaitSessionStop: { _ = try await session.stop() }
+        )
+    }
+
+    deinit {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    var reply: @MainActor () -> Void {
+        { [weak self] in self?.replyCount += 1 }
+    }
+}
+
+private actor LifecycleStoreSpy: RecordingSessionStoring {
+    let paths: RecordingPaths
+    init(paths: RecordingPaths) { self.paths = paths }
+    func prepare(startedAt: Date) async throws -> RecordingPaths { paths }
+    func releaseReservation(for outputURL: URL) async {}
+}
+
+private actor LifecycleCaptureSpy: AudioCapturing {
+    private let startGate: LifecycleAsyncGate?
+    private var startEntered = false
+    private(set) var stopCallCount = 0
+
+    init(startGate: LifecycleAsyncGate?) { self.startGate = startGate }
+
+    func start(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) async throws {
+        startEntered = true
+        if let startGate {
+            await startGate.wait()
+            throw CancellationError()
+        }
+    }
+
+    func stop() async {
+        stopCallCount += 1
+        await startGate?.open()
+    }
+
+    func updateDefaultMicrophone() async throws {}
+
+    func waitUntilStartEntered() async {
+        while !startEntered { await Task.yield() }
+    }
+}
+
+private final class LifecyclePermissionSpy: PermissionChecking, @unchecked Sendable {
+    func currentStatus() async -> CapturePermissionStatus { CapturePermissionStatus(missing: []) }
+    func requestMissingPermissions() async -> CapturePermissionStatus { CapturePermissionStatus(missing: []) }
+}
+
+private final class LifecycleSleepSpy: SleepPreventing, @unchecked Sendable {
+    func begin() {}
+    func end() {}
+}
+
+private actor LifecycleNotificationSpy: RecordingNotifying {
+    func saved(_ recording: SavedRecording) async {}
+    func failed(_ failure: RecordingFailure) async {}
+}
+
+private actor CompositionNotificationBackend: RecordingNotificationBacking {
+    func deliver(_ notification: RecordingNotification) async {}
+}
+
+private actor LifecycleWriterSpy: RecoverableAudioWriting {
+    private let workingURL: URL
+    private let finishGate: LifecycleAsyncGate?
+    private let finishError: RecordingFailure?
+    private var finishEntered = false
+    private(set) var finishCallCount = 0
+    private(set) var abortCallCount = 0
+
+    init(workingURL: URL, finishGate: LifecycleAsyncGate?, finishError: RecordingFailure?) {
+        self.workingURL = workingURL
+        self.finishGate = finishGate
+        self.finishError = finishError
+    }
+
+    func start() async throws {
+        FileManager.default.createFile(atPath: workingURL.path, contents: Data("working".utf8))
+    }
+
+    func append(_ chunk: MixedAudioChunk) async throws {}
+
+    func finish(finalURL: URL) async throws -> URL {
+        finishCallCount += 1
+        finishEntered = true
+        await finishGate?.wait()
+        if let finishError { throw finishError }
+        FileManager.default.createFile(atPath: finalURL.path, contents: Data())
+        try FileManager.default.removeItem(at: workingURL)
+        return finalURL
+    }
+
+    func abort() async { abortCallCount += 1 }
+
+    func waitUntilFinishEntered() async {
+        while !finishEntered { await Task.yield() }
+    }
+}
+
+private actor LifecycleAsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let current = waiters
+        waiters.removeAll()
+        current.forEach { $0.resume() }
+    }
 }
 
 @MainActor
@@ -156,16 +743,20 @@ private final class AppLifecycleHarness {
     private let coordinator: RecordingCoordinatorSpy
     private let termination: TerminationReplySpy
     private let startup: StartupErrorSpy
+    private let feedback: RecoveryFeedbackSpy
     let lifecycle: AppLifecycle
 
     var calls: [String] { callLog.calls }
     var recoveryStates: [Bool] { recovery.states }
     var recoveryMessages: [String?] { recovery.messages }
     var startupErrors: [String] { startup.messages }
+    var feedbacks: [RecoveryFeedback] { feedback.values }
 
     init(
         phase: RecordingPhase = .idle,
+        recoveryRoot: URL = URL(fileURLWithPath: "/tmp/recording-root", isDirectory: true),
         recoveryResults: [RecoveryResult] = [],
+        recoveryError: Error? = nil,
         hotkeyError: Error? = nil,
         loginError: Error? = nil,
         sessionStopError: Error? = nil,
@@ -175,6 +766,7 @@ private final class AppLifecycleHarness {
         let recovery = RecoveryServiceSpy(
             calls: callLog,
             results: recoveryResults,
+            error: recoveryError,
             suspend: suspendRecovery
         )
         let hotkey = HotkeyServiceSpy(calls: callLog, error: hotkeyError)
@@ -185,16 +777,19 @@ private final class AppLifecycleHarness {
         )
         let termination = TerminationReplySpy(calls: callLog)
         let startup = StartupErrorSpy()
+        let feedback = RecoveryFeedbackSpy()
         self.callLog = callLog
         self.recovery = recovery
         self.hotkey = hotkey
         self.coordinator = coordinator
         self.termination = termination
         self.startup = startup
+        self.feedback = feedback
 
         lifecycle = AppLifecycle(
             showMenu: { callLog.calls.append("menu.show") },
             setRecoveryStatus: recovery.setStatus,
+            recoveryRoot: recoveryRoot,
             recover: recovery.run,
             notifyRecoveryResult: { result in
                 switch result.outcome {
@@ -204,6 +799,7 @@ private final class AppLifecycleHarness {
                     callLog.calls.append("notification.failed")
                 }
             },
+            publishRecoveryFeedback: feedback.publish,
             registerHotkey: hotkey.register,
             applyLoginItemSetting: {
                 callLog.calls.append("login.apply")
@@ -230,15 +826,17 @@ private final class LifecycleCallLog {
 private final class RecoveryServiceSpy {
     private let calls: LifecycleCallLog
     private let results: [RecoveryResult]
+    private let error: Error?
     private let suspend: Bool
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var entered = false
     private(set) var states: [Bool] = []
     private(set) var messages: [String?] = []
 
-    init(calls: LifecycleCallLog, results: [RecoveryResult], suspend: Bool) {
+    init(calls: LifecycleCallLog, results: [RecoveryResult], error: Error?, suspend: Bool) {
         self.calls = calls
         self.results = results
+        self.error = error
         self.suspend = suspend
     }
 
@@ -247,7 +845,7 @@ private final class RecoveryServiceSpy {
         messages.append(message)
     }
 
-    func run() async -> [RecoveryResult] {
+    func run() async throws -> [RecoveryResult] {
         calls.calls.append("recovery.run")
         entered = true
         if suspend {
@@ -255,6 +853,7 @@ private final class RecoveryServiceSpy {
                 self.continuation = continuation
             }
         }
+        if let error { throw error }
         return results
     }
 
@@ -329,5 +928,14 @@ private final class StartupErrorSpy {
 
     func record(_ message: String) {
         messages.append(message)
+    }
+}
+
+@MainActor
+private final class RecoveryFeedbackSpy {
+    private(set) var values: [RecoveryFeedback] = []
+
+    func publish(_ feedback: RecoveryFeedback) {
+        values.append(feedback)
     }
 }

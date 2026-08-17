@@ -8,6 +8,7 @@ final class PermissionGatedRecordingAction {
     private let toggle: () async -> Void
     private let updatePermissionMessage: (String?) -> Void
     private var requestInFlight = false
+    let permissionServiceIdentity: ObjectIdentifier
 
     init(
         permissions: any PermissionChecking,
@@ -16,6 +17,7 @@ final class PermissionGatedRecordingAction {
         updatePermissionMessage: @escaping (String?) -> Void
     ) {
         self.permissions = permissions
+        permissionServiceIdentity = ObjectIdentifier(permissions as AnyObject)
         self.phase = phase
         self.toggle = toggle
         self.updatePermissionMessage = updatePermissionMessage
@@ -53,8 +55,16 @@ final class PermissionGatedRecordingAction {
 }
 
 @MainActor
-private final class RecordingActionReference {
-    weak var action: PermissionGatedRecordingAction?
+final class RecordingActionEntrypoint {
+    let action: PermissionGatedRecordingAction
+
+    init(action: PermissionGatedRecordingAction) {
+        self.action = action
+    }
+
+    func perform() async {
+        await action.perform()
+    }
 }
 
 enum LifecycleTerminationDisposition: Equatable {
@@ -66,8 +76,10 @@ enum LifecycleTerminationDisposition: Equatable {
 final class AppLifecycle {
     private let showMenu: () -> Void
     private let setRecoveryStatus: (Bool, String?) -> Void
+    private let recoveryRoot: URL
     private let recover: () async throws -> [RecoveryResult]
     private let notifyRecoveryResult: (RecoveryResult) async -> Void
+    private let publishRecoveryFeedback: (RecoveryFeedback) -> Void
     private let registerHotkey: () throws -> Void
     private let applyLoginItemSetting: () throws -> Void
     private let startupError: (String) -> Void
@@ -84,8 +96,10 @@ final class AppLifecycle {
     init(
         showMenu: @escaping () -> Void,
         setRecoveryStatus: @escaping (Bool, String?) -> Void,
+        recoveryRoot: URL = AppMetadata.defaultRecordingRoot,
         recover: @escaping () async throws -> [RecoveryResult],
         notifyRecoveryResult: @escaping (RecoveryResult) async -> Void,
+        publishRecoveryFeedback: @escaping (RecoveryFeedback) -> Void = { _ in },
         registerHotkey: @escaping () throws -> Void,
         applyLoginItemSetting: @escaping () throws -> Void,
         startupError: @escaping (String) -> Void,
@@ -95,8 +109,10 @@ final class AppLifecycle {
     ) {
         self.showMenu = showMenu
         self.setRecoveryStatus = setRecoveryStatus
+        self.recoveryRoot = recoveryRoot
         self.recover = recover
         self.notifyRecoveryResult = notifyRecoveryResult
+        self.publishRecoveryFeedback = publishRecoveryFeedback
         self.registerHotkey = registerHotkey
         self.applyLoginItemSetting = applyLoginItemSetting
         self.startupError = startupError
@@ -175,11 +191,40 @@ final class AppLifecycle {
             for result in results {
                 setRecoveryStatus(true, Self.message(for: result))
                 await notifyRecoveryResult(result)
+                if case let .failed(workingURL, message) = result.outcome {
+                    publishRecoveryFeedback(RecoveryFeedback(
+                        id: "recovery-failed-\(workingURL.standardizedFileURL.path)",
+                        title: "录音恢复失败",
+                        message: "\(workingURL.path)\n\(message)",
+                        revealURL: workingURL,
+                        isFailure: true
+                    ))
+                }
             }
-            setRecoveryStatus(false, Self.summary(for: results))
+            let recoveredCount = results.reduce(into: 0) { count, result in
+                if case .recovered = result.outcome { count += 1 }
+            }
+            if recoveredCount > 0 {
+                publishRecoveryFeedback(RecoveryFeedback(
+                    id: "recovery-success-summary",
+                    title: "录音恢复完成",
+                    message: "已恢复 \(recoveredCount) 条中断录音。",
+                    revealURL: nil,
+                    isFailure: false
+                ))
+            }
+            setRecoveryStatus(false, nil)
         } catch {
-            startupError("恢复中断录音失败：\(error.localizedDescription)")
-            setRecoveryStatus(false, "恢复检查失败，已保留工作文件。")
+            let message = "\(recoveryRoot.path)\n\(Self.errorMessage(error))"
+            startupError("恢复中断录音失败：\(message)")
+            publishRecoveryFeedback(RecoveryFeedback(
+                id: "recovery-batch-failed-\(recoveryRoot.standardizedFileURL.path)",
+                title: "无法检查中断录音",
+                message: message,
+                revealURL: recoveryRoot,
+                isFailure: true
+            ))
+            setRecoveryStatus(false, nil)
         }
         isRecovering = false
 
@@ -217,17 +262,11 @@ final class AppLifecycle {
         }
     }
 
-    private static func summary(for results: [RecoveryResult]) -> String? {
-        guard !results.isEmpty else { return nil }
-        let recoveredCount = results.reduce(into: 0) { count, result in
-            if case .recovered = result.outcome { count += 1 }
-        }
-        let failedCount = results.count - recoveredCount
-        if failedCount == 0 {
-            return "已恢复 \(recoveredCount) 条中断录音。"
-        }
-        return "已恢复 \(recoveredCount) 条，\(failedCount) 条仍保留为工作文件。"
+    private static func errorMessage(_ error: Error) -> String {
+        if let failure = error as? RecordingFailure { return failure.message }
+        return error.localizedDescription
     }
+
 }
 
 struct LaunchRecordingLocation {
@@ -253,6 +292,94 @@ struct LaunchRecordingLocation {
     }
 }
 
+struct ProductionCompositionIdentitySnapshot: Equatable {
+    let permissionForAction: ObjectIdentifier
+    let permissionForSession: ObjectIdentifier
+    let activityGateForSession: ObjectIdentifier
+    let activityGateForRecovery: ObjectIdentifier
+    let storeForSession: ObjectIdentifier
+    let storeForRecovery: ObjectIdentifier
+    let notificationForSession: ObjectIdentifier
+    let notificationHeldByApp: ObjectIdentifier
+    let buttonActionEntrypoint: ObjectIdentifier
+    let hotkeyActionEntrypoint: ObjectIdentifier
+    let launchRecordingRoot: URL
+    let storeRecordingRoot: URL
+}
+
+@MainActor
+final class ProductionCompositionRoot {
+    let settingsStore: AppSettingsStore
+    let launchSettings: AppSettings
+    let permissions: PermissionService
+    let activityGate: RecordingActivityGate
+    let recordingStore: RecordingStore
+    let capture: ScreenCaptureEngine
+    let sleep: SleepPreventionService
+    let notifications: NotificationService
+    let session: LiveRecordingSessionManager
+    let recovery: RecoveryService
+    let coordinator: RecordingCoordinator
+    let hotkey: HotkeyService
+    let loginItem: LoginItemService
+
+    init(
+        settingsStore: AppSettingsStore = AppSettingsStore(),
+        notificationService: NotificationService? = nil
+    ) {
+        self.settingsStore = settingsStore
+        let settings = settingsStore.load()
+        launchSettings = settings
+        let permissions = PermissionService()
+        let activityGate = RecordingActivityGate()
+        let recordingStore = RecordingStore(root: settings.recordingRoot)
+        let capture = ScreenCaptureEngine()
+        let sleep = SleepPreventionService()
+        let notifications = notificationService ?? NotificationService()
+        let session = LiveRecordingSessionManager(
+            activityGate: activityGate,
+            store: recordingStore,
+            capture: capture,
+            permissions: permissions,
+            sleep: sleep,
+            notifications: notifications
+        )
+        let recovery = RecoveryService(activityGate: activityGate, store: recordingStore)
+
+        self.permissions = permissions
+        self.activityGate = activityGate
+        self.recordingStore = recordingStore
+        self.capture = capture
+        self.sleep = sleep
+        self.notifications = notifications
+        self.session = session
+        self.recovery = recovery
+        coordinator = RecordingCoordinator(session: session)
+        hotkey = HotkeyService()
+        loginItem = LoginItemService()
+    }
+
+    func identitySnapshot(
+        action: PermissionGatedRecordingAction,
+        entrypoint: RecordingActionEntrypoint
+    ) -> ProductionCompositionIdentitySnapshot {
+        ProductionCompositionIdentitySnapshot(
+            permissionForAction: action.permissionServiceIdentity,
+            permissionForSession: ObjectIdentifier(permissions),
+            activityGateForSession: ObjectIdentifier(activityGate),
+            activityGateForRecovery: ObjectIdentifier(activityGate),
+            storeForSession: ObjectIdentifier(recordingStore),
+            storeForRecovery: ObjectIdentifier(recordingStore),
+            notificationForSession: ObjectIdentifier(notifications),
+            notificationHeldByApp: ObjectIdentifier(notifications),
+            buttonActionEntrypoint: ObjectIdentifier(entrypoint),
+            hotkeyActionEntrypoint: ObjectIdentifier(entrypoint),
+            launchRecordingRoot: launchSettings.recordingRoot,
+            storeRecordingRoot: launchSettings.recordingRoot
+        )
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menuBarController = MenuBarController()
@@ -263,47 +390,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var launchRecordingLocation: LaunchRecordingLocation?
     private var lifecycle: AppLifecycle?
 
-    // These services intentionally live for the full app lifetime. In particular,
-    // NotificationService must retain its notification-center delegate after launch.
-    private var permissionService: PermissionService?
-    private var activityGate: RecordingActivityGate?
-    private var recordingStore: RecordingStore?
-    private var captureEngine: ScreenCaptureEngine?
-    private var sleepPreventionService: SleepPreventionService?
-    private var notificationService: NotificationService?
-    private var sessionManager: LiveRecordingSessionManager?
-    private var recoveryService: RecoveryService?
-    private var hotkeyService: HotkeyService?
-    private var loginItemService: LoginItemService?
+    // Retaining the composition root also retains NotificationService's delegate for app lifetime.
+    private var compositionRoot: ProductionCompositionRoot?
+    private var compositionIdentitySnapshot: ProductionCompositionIdentitySnapshot?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let settingsStore = AppSettingsStore()
-        let settings = settingsStore.load()
-        let permissions = PermissionService()
-        let activityGate = RecordingActivityGate()
-        let recordingStore = RecordingStore(root: settings.recordingRoot)
-        let capture = ScreenCaptureEngine()
-        let sleep = SleepPreventionService()
-        let notifications = NotificationService()
-        let session = LiveRecordingSessionManager(
-            activityGate: activityGate,
-            store: recordingStore,
-            capture: capture,
-            permissions: permissions,
-            sleep: sleep,
-            notifications: notifications
-        )
-        let recovery = RecoveryService(
-            activityGate: activityGate,
-            store: recordingStore
-        )
-        let coordinator = RecordingCoordinator(session: session)
-        let hotkey = HotkeyService()
-        let loginItem = LoginItemService()
+        let composition = ProductionCompositionRoot()
+        let settingsStore = composition.settingsStore
+        let settings = composition.launchSettings
+        let permissions = composition.permissions
+        let session = composition.session
+        let recovery = composition.recovery
+        let notifications = composition.notifications
+        let coordinator = composition.coordinator
+        let hotkey = composition.hotkey
+        let loginItem = composition.loginItem
 
-        let recordingActionReference = RecordingActionReference()
+        weak var weakMenuModel: MenuBarViewModel?
+        let recordingAction = PermissionGatedRecordingAction(
+            permissions: permissions,
+            phase: { coordinator.phase },
+            toggle: { await coordinator.toggleRecording() },
+            updatePermissionMessage: { message in weakMenuModel?.permissionMessage = message }
+        )
+        let actionEntrypoint = RecordingActionEntrypoint(action: recordingAction)
         let recordingHandler: @Sendable () -> Void = {
-            Task { @MainActor in await recordingActionReference.action?.perform() }
+            Task { @MainActor in await actionEntrypoint.perform() }
         }
         let settingsModel = SettingsViewModel(
             initialSettings: settings,
@@ -314,14 +426,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hotkeyAction: recordingHandler
         )
 
-        weak var weakMenuModel: MenuBarViewModel?
-        let recordingAction = PermissionGatedRecordingAction(
-            permissions: permissions,
-            phase: { coordinator.phase },
-            toggle: { await coordinator.toggleRecording() },
-            updatePermissionMessage: { message in weakMenuModel?.permissionMessage = message }
-        )
-        recordingActionReference.action = recordingAction
         let menuModel = MenuBarViewModel(
             coordinator: coordinator,
             recordingRoot: settings.recordingRoot,
@@ -333,15 +437,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let lifecycle = AppLifecycle(
             showMenu: { [menuBarController] in
+                menuModel.setRecovery(
+                    isRecovering: true,
+                    message: "正在检查上次中断的录音，请稍候。"
+                )
+                settingsModel.setLifecycleBusy(true)
                 menuBarController.show(rootView: MenuBarView(model: menuModel))
                 menuBarController.bind(to: menuModel)
             },
             setRecoveryStatus: { isRecovering, message in
                 menuModel.setRecovery(isRecovering: isRecovering, message: message)
+                settingsModel.setLifecycleBusy(isRecovering)
             },
+            recoveryRoot: settings.recordingRoot,
             recover: {
                 let results = await recovery.recoverInterruptedRecordings()
                 if let failure = await recovery.lastFailure {
+                    throw failure
+                }
+                if let failure = await recovery.lastBatchFailure {
                     throw failure
                 }
                 return results
@@ -361,11 +475,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await notifications.failed(RecordingFailure(code: .finalize, message: message))
                 }
             },
+            publishRecoveryFeedback: menuModel.publishRecoveryFeedback,
             registerHotkey: {
-                try hotkey.register(settings.hotkey, handler: recordingHandler)
+                try hotkey.register(settingsModel.settings.hotkey, handler: recordingHandler)
             },
             applyLoginItemSetting: {
-                try loginItem.setEnabled(settings.launchAtLogin)
+                try loginItem.setEnabled(settingsModel.settings.launchAtLogin)
                 settingsModel.refreshSystemState()
             },
             startupError: { message in
@@ -386,16 +501,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.recordingAction = recordingAction
         launchRecordingLocation = LaunchRecordingLocation(root: settings.recordingRoot)
         self.lifecycle = lifecycle
-        permissionService = permissions
-        self.activityGate = activityGate
-        self.recordingStore = recordingStore
-        captureEngine = capture
-        sleepPreventionService = sleep
-        notificationService = notifications
-        sessionManager = session
-        recoveryService = recovery
-        hotkeyService = hotkey
-        loginItemService = loginItem
+        compositionRoot = composition
+        compositionIdentitySnapshot = composition.identitySnapshot(
+            action: recordingAction,
+            entrypoint: actionEntrypoint
+        )
         lifecycle.start()
 
         Task { [weak menuModel, weak lifecycle] in
@@ -419,7 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showSettings() {
-        guard let settingsModel else { return }
+        guard menuModel?.isRecovering == false, let settingsModel else { return }
         menuBarController.showSettings(model: settingsModel)
     }
 

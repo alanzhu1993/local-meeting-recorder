@@ -5,6 +5,26 @@ import XCTest
 @testable import MeetingRecorderApp
 
 @MainActor
+private final class MenuSessionSpy: RecordingSessionManaging {
+    func events() async -> AsyncStream<RecordingSessionEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func start(at date: Date) async throws -> ActiveRecording {
+        ActiveRecording(startedAt: date, workingURL: URL(fileURLWithPath: "/tmp/working.mov"))
+    }
+
+    func stop() async throws -> SavedRecording {
+        SavedRecording(
+            startedAt: Date(),
+            duration: 0,
+            fileURL: URL(fileURLWithPath: "/tmp/saved.m4a"),
+            recovered: false
+        )
+    }
+}
+
+@MainActor
 final class MenuBarPresentationTests: XCTestCase {
     private let active = ActiveRecording(
         startedAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -373,6 +393,78 @@ final class MenuBarPresentationTests: XCTestCase {
 
         XCTAssertFalse(stopping.showsAudioMeter)
         XCTAssertTrue(recording.showsAudioMeter)
+    }
+
+    func testRecoveryFailureRemainsVisibleAfterRecoveryAndRevealsFullWorkingPath() {
+        let workingURL = URL(fileURLWithPath: "/tmp/recordings/.meeting.inprogress.mov")
+        var revealedURL: URL?
+        let model = MenuBarViewModel.preview(onRevealRecoveryURL: { revealedURL = $0 })
+        let feedback = RecoveryFeedback(
+            id: "failed-working",
+            title: "录音恢复失败",
+            message: "\(workingURL.path)\ncannot finalize",
+            revealURL: workingURL,
+            isFailure: true
+        )
+
+        model.setRecovery(isRecovering: true, message: "recovering")
+        model.publishRecoveryFeedback(feedback)
+        model.setRecovery(isRecovering: false)
+
+        XCTAssertFalse(model.isRecovering)
+        XCTAssertEqual(model.recoveryFeedbacks, [feedback])
+        XCTAssertTrue(model.recoveryFeedbacks[0].message.contains(workingURL.path))
+        model.revealRecoveryFeedback(id: feedback.id)
+        XCTAssertEqual(revealedURL, workingURL)
+        model.dismissRecoveryFeedback(id: feedback.id)
+        XCTAssertTrue(model.recoveryFeedbacks.isEmpty)
+    }
+
+    func testSettingsActionIsBlockedDuringRecovery() {
+        let session = MenuSessionSpy()
+        let coordinator = RecordingCoordinator(session: session)
+        var showSettingsCount = 0
+        let model = MenuBarViewModel(
+            coordinator: coordinator,
+            recordingRoot: AppMetadata.defaultRecordingRoot,
+            onPrimaryAction: {},
+            onOpenToday: {},
+            onShowSettings: { showSettingsCount += 1 }
+        )
+
+        model.setRecovery(isRecovering: true)
+        model.showSettings()
+        XCTAssertEqual(showSettingsCount, 0)
+
+        model.setRecovery(isRecovering: false)
+        model.showSettings()
+        XCTAssertEqual(showSettingsCount, 1)
+    }
+
+    func testSettingsMutationsAreBlockedWhileLifecycleIsRecovering() {
+        let replacement = HotkeyDescriptor(keyCode: 1, modifiers: 0x0100, displayText: "⌘S")
+        let persistence = SettingsPersistenceSpy(settings: .default)
+        let hotkey = HotkeyRegistrationSpy()
+        let login = LoginItemSpy()
+        let model = SettingsViewModel(
+            initialSettings: .default,
+            persistence: persistence,
+            hotkey: hotkey,
+            loginItem: login
+        )
+
+        model.setLifecycleBusy(true)
+        model.applyHotkey(replacement)
+        model.setLaunchAtLogin(false)
+
+        XCTAssertEqual(model.settings, .default)
+        XCTAssertTrue(hotkey.registrations.isEmpty)
+        XCTAssertTrue(login.isEnabled)
+        XCTAssertTrue(persistence.savedSettings.isEmpty)
+
+        model.setLifecycleBusy(false)
+        model.applyHotkey(replacement)
+        XCTAssertEqual(model.settings.hotkey, replacement)
     }
 
     func testSettingsWindowReusesOneWindow() {

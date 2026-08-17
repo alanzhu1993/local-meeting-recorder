@@ -194,8 +194,11 @@ final class RecoveryServiceTests: XCTestCase {
 
         XCTAssertTrue(results.isEmpty)
         let isRecovering = await service.isRecovering
+        let batchFailure = await service.lastBatchFailure
         let callCount = await finalizer.callCount
         XCTAssertFalse(isRecovering)
+        XCTAssertEqual(batchFailure?.code, .write)
+        XCTAssertEqual(batchFailure?.message, "scan failed")
         XCTAssertEqual(callCount, 0)
     }
 
