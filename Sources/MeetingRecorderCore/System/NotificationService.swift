@@ -8,6 +8,8 @@ public protocol RecordingNotifying: Sendable {
 }
 
 public struct RecordingNotification: Equatable, Sendable {
+    public static let fileURLUserInfoKey = "MeetingRecorder.recordingFileURL"
+
     public let identifier: String
     public let title: String
     public let body: String
@@ -21,6 +23,20 @@ public struct RecordingNotification: Equatable, Sendable {
         self.fileURL = fileURL
         self.playsSound = playsSound
     }
+
+    public var userInfo: [String: String] {
+        guard let fileURL else { return [:] }
+        return [Self.fileURLUserInfoKey: fileURL.absoluteString]
+    }
+
+    public static func fileURL(from userInfo: [AnyHashable: Any]) -> URL? {
+        guard let value = userInfo[fileURLUserInfoKey] as? String,
+              let fileURL = URL(string: value),
+              fileURL.isFileURL else {
+            return nil
+        }
+        return fileURL
+    }
 }
 
 public protocol RecordingNotificationBacking: Sendable {
@@ -29,6 +45,10 @@ public protocol RecordingNotificationBacking: Sendable {
 
 public final class NotificationService: RecordingNotifying, @unchecked Sendable {
     private let backend: any RecordingNotificationBacking
+
+    public static var foregroundPresentationOptions: UNNotificationPresentationOptions {
+        [.banner, .list]
+    }
 
     public init() {
         backend = UserNotificationBackend()
@@ -62,7 +82,6 @@ public final class NotificationService: RecordingNotifying, @unchecked Sendable 
 
 private final class UserNotificationBackend: NSObject, RecordingNotificationBacking, UNUserNotificationCenterDelegate, @unchecked Sendable {
     private let center: UNUserNotificationCenter
-    private let savedFiles = SavedFileStore()
 
     override init() {
         center = .current()
@@ -71,16 +90,13 @@ private final class UserNotificationBackend: NSObject, RecordingNotificationBack
     }
 
     func deliver(_ notification: RecordingNotification) async {
-        if let fileURL = notification.fileURL {
-            savedFiles.store(fileURL, for: notification.identifier)
-        }
-
         guard (try? await center.requestAuthorization(options: [.alert])) == true else { return }
 
         let content = UNMutableNotificationContent()
         content.title = notification.title
         content.body = notification.body
         content.sound = nil
+        content.userInfo = notification.userInfo
         let request = UNNotificationRequest(identifier: notification.identifier, content: content, trigger: nil)
         try? await center.add(request)
     }
@@ -89,28 +105,18 @@ private final class UserNotificationBackend: NSObject, RecordingNotificationBack
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        let fileURL = savedFiles.take(for: response.notification.request.identifier)
+        let fileURL = RecordingNotification.fileURL(from: response.notification.request.content.userInfo)
         if let fileURL {
             await MainActor.run {
                 NSWorkspace.shared.activateFileViewerSelecting([fileURL])
             }
         }
     }
-}
 
-private final class SavedFileStore: @unchecked Sendable {
-    private let lock = NSLock()
-    private var files: [String: URL] = [:]
-
-    func store(_ fileURL: URL, for identifier: String) {
-        lock.withLock {
-            files[identifier] = fileURL
-        }
-    }
-
-    func take(for identifier: String) -> URL? {
-        lock.withLock {
-            files.removeValue(forKey: identifier)
-        }
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        NotificationService.foregroundPresentationOptions
     }
 }

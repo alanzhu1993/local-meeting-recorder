@@ -15,16 +15,35 @@ final class HotkeyServiceTests: XCTestCase {
         XCTAssertEqual(backend.unregisterCount, 0)
     }
 
-    func testHandlerOnlyReceivesItsOwnCarbonIdentifier() throws {
+    func testRegistersWithExclusiveCarbonOption() throws {
         let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
         let service = HotkeyService(backend: backend)
-        let invocationCount = LockedCounter()
 
-        try service.register(AppMetadata.defaultHotkey) { invocationCount.increment() }
-        backend.fire(HotkeyEventID(signature: 0xDEAD_BEEF, identifier: 7))
-        backend.fire(HotkeyService.eventIdentifier)
+        try service.register(AppMetadata.defaultHotkey, handler: {})
 
-        XCTAssertEqual(invocationCount.value, 1)
+        XCTAssertEqual(backend.registerOptions, UInt32(kEventHotKeyExclusive))
+    }
+
+    func testMultipleServicesUseDifferentIdentifiersAndLeaveOtherHandlersInChain() throws {
+        let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
+        let first = HotkeyService(backend: backend)
+        let second = HotkeyService(backend: backend)
+        let firstCount = LockedCounter()
+        let secondCount = LockedCounter()
+
+        try first.register(AppMetadata.defaultHotkey) { firstCount.increment() }
+        try second.register(HotkeyDescriptor(keyCode: 16, modifiers: 0x1000, displayText: "⌃T")) { secondCount.increment() }
+        XCTAssertNotEqual(first.eventIdentifier, second.eventIdentifier)
+
+        XCTAssertEqual(backend.fire(first.eventIdentifier), noErr)
+        XCTAssertEqual(firstCount.value, 1)
+        XCTAssertEqual(secondCount.value, 0)
+
+        XCTAssertEqual(backend.fire(second.eventIdentifier), noErr)
+        XCTAssertEqual(firstCount.value, 1)
+        XCTAssertEqual(secondCount.value, 1)
+
+        XCTAssertEqual(backend.fire(HotkeyEventID(signature: 0xDEAD_BEEF, identifier: 7)), OSStatus(eventNotHandledErr))
     }
 
     func testDuplicateRegistrationDoesNotAskCarbonToRegisterAgain() throws {
@@ -49,6 +68,45 @@ final class HotkeyServiceTests: XCTestCase {
         XCTAssertEqual(backend.unregisterCount, 1)
         XCTAssertEqual(backend.removeHandlerCount, 1)
     }
+
+    func testTeardownFailureKeepsContextCallableAndCanBeRetried() throws {
+        let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
+        backend.removeResults = [OSStatus(-50), noErr]
+        let service = HotkeyService(backend: backend)
+        let count = LockedCounter()
+        try service.register(AppMetadata.defaultHotkey) { count.increment() }
+
+        service.unregister()
+        XCTAssertNotNil(service.lastTeardownError)
+        XCTAssertEqual(backend.fire(service.eventIdentifier), noErr)
+        XCTAssertEqual(count.value, 1)
+
+        service.unregister()
+        XCTAssertNil(service.lastTeardownError)
+        XCTAssertEqual(backend.unregisterCount, 1)
+        XCTAssertEqual(backend.removeHandlerCount, 2)
+    }
+
+    func testConcurrentRegisterAndUnregisterCallsAreSerializedOnMainEventThread() {
+        let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
+        let service = HotkeyService(backend: backend)
+        let finished = expectation(description: "background callers finish")
+
+        DispatchQueue.global().async {
+            DispatchQueue.concurrentPerform(iterations: 12) { _ in
+                try? service.register(AppMetadata.defaultHotkey, handler: {})
+            }
+            DispatchQueue.concurrentPerform(iterations: 12) { _ in
+                service.unregister()
+            }
+            finished.fulfill()
+        }
+
+        wait(for: [finished], timeout: 2)
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 1)
+        XCTAssertEqual(backend.removeHandlerCount, 1)
+    }
 }
 
 private final class LockedCounter: @unchecked Sendable {
@@ -66,37 +124,50 @@ private final class LockedCounter: @unchecked Sendable {
 
 private final class HotkeyBackendStub: HotkeyBackend, @unchecked Sendable {
     let registerResult: Result<HotkeyRegistration, HotkeyBackendError>
-    private var eventHandler: (@Sendable (HotkeyEventID) -> Void)?
+    private var eventHandlers: [UUID: @Sendable (HotkeyEventID) -> OSStatus] = [:]
     var installCount = 0
     var removeHandlerCount = 0
     var registerCount = 0
     var unregisterCount = 0
+    var registerOptions: UInt32?
+    var removeResults: [OSStatus] = []
 
     init(registerResult: Result<HotkeyRegistration, HotkeyBackendError>) {
         self.registerResult = registerResult
     }
 
-    func installEventHandler(_ handler: @escaping @Sendable (HotkeyEventID) -> Void) throws -> HotkeyHandlerToken {
+    func installEventHandler(_ handler: @escaping @Sendable (HotkeyEventID) -> OSStatus) throws -> HotkeyHandlerToken {
         installCount += 1
-        eventHandler = handler
-        return HotkeyHandlerToken()
+        let token = HotkeyHandlerToken()
+        eventHandlers[token.identifier] = handler
+        return token
     }
 
-    func removeEventHandler(_ token: HotkeyHandlerToken) {
+    func removeEventHandler(_ token: HotkeyHandlerToken) -> OSStatus {
         removeHandlerCount += 1
-        eventHandler = nil
+        let result = removeResults.isEmpty ? noErr : removeResults.removeFirst()
+        if result == noErr {
+            eventHandlers[token.identifier] = nil
+        }
+        return result
     }
 
-    func register(_ descriptor: HotkeyDescriptor, identifier: HotkeyEventID) throws -> HotkeyRegistration {
+    func register(_ descriptor: HotkeyDescriptor, identifier: HotkeyEventID, options: UInt32) throws -> HotkeyRegistration {
         registerCount += 1
+        registerOptions = options
         return try registerResult.get()
     }
 
-    func unregister(_ registration: HotkeyRegistration) {
+    func unregister(_ registration: HotkeyRegistration) -> OSStatus {
         unregisterCount += 1
+        return noErr
     }
 
-    func fire(_ identifier: HotkeyEventID) {
-        eventHandler?(identifier)
+    func fire(_ identifier: HotkeyEventID) -> OSStatus {
+        for eventHandler in eventHandlers.values {
+            let result = eventHandler(identifier)
+            if result == noErr { return noErr }
+        }
+        return OSStatus(eventNotHandledErr)
     }
 }

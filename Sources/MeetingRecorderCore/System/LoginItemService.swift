@@ -41,6 +41,7 @@ public enum LoginItemServiceError: Error, Equatable, Sendable, LocalizedError {
 
 public final class LoginItemService: LoginItemManaging, @unchecked Sendable {
     private let backend: any LoginItemBacking
+    private let lock = NSLock()
 
     public init() {
         backend = ServiceManagementLoginItemBackend()
@@ -51,29 +52,33 @@ public final class LoginItemService: LoginItemManaging, @unchecked Sendable {
     }
 
     public var isEnabled: Bool {
-        backend.status() == .enabled
+        lock.withLock { backend.status() == .enabled }
     }
 
     public func setEnabled(_ enabled: Bool) throws {
-        let status = backend.status()
-        switch (enabled, status) {
-        case (_, .unavailable):
-            throw LoginItemServiceError.unavailable
-        case (true, .enabled), (false, .disabled):
-            return
-        case (true, .requiresApproval):
-            throw LoginItemServiceError.requiresApproval
-        case (true, .disabled):
-            do {
-                try backend.register()
-            } catch {
-                throw LoginItemServiceError.registrationFailed(error.localizedDescription)
-            }
-        case (false, .enabled), (false, .requiresApproval):
-            do {
-                try backend.unregister()
-            } catch {
-                throw LoginItemServiceError.unregistrationFailed(error.localizedDescription)
+        try lock.withLock {
+            let status = backend.status()
+            switch (enabled, status) {
+            case (_, .unavailable):
+                throw LoginItemServiceError.unavailable
+            case (true, .enabled), (false, .disabled):
+                return
+            case (true, .requiresApproval):
+                throw LoginItemServiceError.requiresApproval
+            case (true, .disabled):
+                do {
+                    try backend.register()
+                } catch {
+                    if backend.status() == .enabled { return }
+                    throw LoginItemServiceError.registrationFailed(error.localizedDescription)
+                }
+            case (false, .enabled), (false, .requiresApproval):
+                do {
+                    try backend.unregister()
+                } catch {
+                    if backend.status() == .disabled { return }
+                    throw LoginItemServiceError.unregistrationFailed(error.localizedDescription)
+                }
             }
         }
     }

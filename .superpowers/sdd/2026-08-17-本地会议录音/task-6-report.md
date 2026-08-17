@@ -26,3 +26,14 @@
 - 未在真实用户会话中触发屏幕录制、麦克风或通知授权弹窗。
 - 未真实注册默认快捷键，也未手工制造第三方快捷键冲突。
 - 未实际修改本机登录项或验证系统设置中的批准流程。
+
+## Fix Round 1（2026-08-17）
+
+- Carbon 注册现在传入 `kEventHotKeyExclusive`，系统占用会返回可操作的快捷键冲突提示。
+- 每个 `HotkeyService` 在进程内取得独立的 `EventHotKeyID`；回调只消费自己的 ID，其他事件返回 `eventNotHandledErr` 让 Carbon handler chain 继续处理。
+- 所有实际 Carbon 安装、注册、注销和移除操作都经主事件线程串行执行。注销失败会保留注册和回调上下文，并暴露 `lastTeardownError`；再次调用 `unregister()` 会重试。回调上下文由 handler token 强持有，直到 `RemoveEventHandler` 成功后才释放。
+- 保存通知把文件 URL 写入 `UNNotificationContent.userInfo`，点击时直接读取该值；不再维护会随通知增长或因服务重建丢失的内存映射。前台通知显示 banner/list，仍不带声音。
+- 登录启动的读取、判断和 register/unregister 操作由同一把锁保护；动作抛错后会重新读取状态，若目标已达成则视为成功。相反目标的调用按取得锁的顺序线性执行，后完成的调用决定最终状态。
+- 新增测试覆盖独占选项、多服务 handler chain、并发注册/注销、注销失败后回调与重试、通知 payload、前台静音展示、登录启动同目标并发与动作后错误回读。
+- 本轮未做真实 Carbon smoke：避免在 Alan 正在使用的会话中临时注册全局快捷键；Carbon 调用路径由注入 backend 的测试覆盖，真实系统行为仍需手工验证。
+- 本轮验证：`PermissionServiceTests` 3/3、`HotkeyServiceTests` 7/7、`SystemServiceTests` 8/8 均通过；全量 `swift test -Xswiftc -warnings-as-errors` 为 89/89 通过；`git diff --check` 通过。
