@@ -5,15 +5,24 @@ import Foundation
 struct M4AFinalizerHooks: Sendable {
     let afterClaimAcquired: (@Sendable () async throws -> Void)?
     let onClaimContention: (@Sendable () -> Void)?
+    let interruptAfterPendingPersisted: (@Sendable () -> Bool)?
+    let interruptAfterLink: (@Sendable () -> Bool)?
+    let finalizedMarkerWrite: (@Sendable () throws -> Void)?
     let cleanupSource: (@Sendable (URL) throws -> Void)?
 
     init(
         afterClaimAcquired: (@Sendable () async throws -> Void)? = nil,
         onClaimContention: (@Sendable () -> Void)? = nil,
+        interruptAfterPendingPersisted: (@Sendable () -> Bool)? = nil,
+        interruptAfterLink: (@Sendable () -> Bool)? = nil,
+        finalizedMarkerWrite: (@Sendable () throws -> Void)? = nil,
         cleanupSource: (@Sendable (URL) throws -> Void)? = nil
     ) {
         self.afterClaimAcquired = afterClaimAcquired
         self.onClaimContention = onClaimContention
+        self.interruptAfterPendingPersisted = interruptAfterPendingPersisted
+        self.interruptAfterLink = interruptAfterLink
+        self.finalizedMarkerWrite = finalizedMarkerWrite
         self.cleanupSource = cleanupSource
     }
 }
@@ -44,6 +53,7 @@ public struct M4AFinalizer: Sendable {
         try Task.checkCancellation()
 
         if let committed = try claim.committedOutput(requestedURL: recoveredURL) {
+            cleanupCommittedSource(claim.canonicalWorkingURL)
             return committed
         }
         guard !FileManager.default.fileExists(atPath: recoveredURL.path) else {
@@ -75,7 +85,12 @@ public struct M4AFinalizer: Sendable {
         claim: RecoveryClaim
     ) async throws -> URL {
         let temporaryURL = temporaryM4A(near: recoveredURL)
-        defer { removeIfPresent(temporaryURL) }
+        var preserveTemporaryForSimulatedInterruption = false
+        defer {
+            if !preserveTemporaryForSimulatedInterruption {
+                removeIfPresent(temporaryURL)
+            }
+        }
         try await export(
             asset: AVURLAsset(url: workingURL),
             preset: AVAssetExportPresetPassthrough,
@@ -84,7 +99,12 @@ public struct M4AFinalizer: Sendable {
         )
         try await validateM4A(at: temporaryURL)
         try Task.checkCancellation()
-        try commit(temporaryURL, to: recoveredURL, claim: claim)
+        do {
+            try commit(temporaryURL, to: recoveredURL, claim: claim)
+        } catch let interruption as CommitInterruption {
+            preserveTemporaryForSimulatedInterruption = true
+            throw failure(interruption.message)
+        }
         cleanupCommittedSource(workingURL)
         return recoveredURL
     }
@@ -178,7 +198,12 @@ public struct M4AFinalizer: Sendable {
         }
 
         let temporaryURL = temporaryM4A(near: recoveredURL)
-        defer { removeIfPresent(temporaryURL) }
+        var preserveTemporaryForSimulatedInterruption = false
+        defer {
+            if !preserveTemporaryForSimulatedInterruption {
+                removeIfPresent(temporaryURL)
+            }
+        }
         try await export(
             asset: positioned.composition,
             preset: AVAssetExportPresetAppleM4A,
@@ -187,7 +212,12 @@ public struct M4AFinalizer: Sendable {
         )
         try await validateM4A(at: temporaryURL)
         try Task.checkCancellation()
-        try commit(temporaryURL, to: recoveredURL, claim: claim)
+        do {
+            try commit(temporaryURL, to: recoveredURL, claim: claim)
+        } catch let interruption as CommitInterruption {
+            preserveTemporaryForSimulatedInterruption = true
+            throw failure(interruption.message)
+        }
 
         var cleanedPaths = Set<String>()
         for url in cleanupURLs where cleanedPaths.insert(url.path).inserted {
@@ -380,21 +410,41 @@ public struct M4AFinalizer: Sendable {
             outputURL: outputURL,
             stagedURL: temporaryURL
         )
+        if hooks.interruptAfterPendingPersisted?() == true {
+            throw CommitInterruption.afterPending
+        }
         let result = temporaryURL.path.withCString { temporaryPath in
             outputURL.path.withCString { outputPath in
                 link(temporaryPath, outputPath)
             }
         }
-        guard result == 0 else {
-            let reason = String(cString: strerror(errno))
-            try? claim.cancelPendingCommit(pending)
+        let linkError = errno
+        if result != 0, !claim.targetMatches(pending) {
+            let reason = String(cString: strerror(linkError))
+            do {
+                try claim.cancelPendingCommit(pending)
+            } catch {
+                throw failure(
+                    "Could not publish audio and could not roll back its bound pending target: \(reason)"
+                )
+            }
             throw failure("Could not publish audio without overwriting: \(reason)")
+        }
+        if hooks.interruptAfterLink?() == true {
+            throw CommitInterruption.afterLink
         }
 
         // The hard link above is the commit point. The pending inode marker was
-        // persisted first, so a process ending between link and this best-effort
-        // state update can still recognize the committed target by inode.
-        try? claim.markCommitComplete(pending)
+        // persisted first and remains permanently bound to this target. Failure
+        // to upgrade the marker leaves the conservative pending binding intact.
+        do {
+            try hooks.finalizedMarkerWrite?()
+            try claim.markCommitComplete(pending)
+        } catch {
+            // There is no warning channel on this interface. The caller still
+            // receives the committed URL; a later finalizer reads the pending
+            // marker and refuses every different target.
+        }
     }
 
     private func childURL(named fileName: String, in directory: URL) throws -> URL {
@@ -448,17 +498,32 @@ private struct PositionedRecoveryComposition {
     let recoveredSegmentCount: Int
 }
 
+private enum CommitInterruption: Error {
+    case afterPending
+    case afterLink
+
+    var message: String {
+        switch self {
+        case .afterPending:
+            "Simulated process interruption after pending target persistence."
+        case .afterLink:
+            "Simulated process interruption after the publish commit point."
+        }
+    }
+}
+
 private struct InodeFinalizationMarker: Codable, Equatable {
     enum State: String, Codable {
         case pending
         case finalized
     }
 
-    static let version = 1
+    static let version = 2
 
     let version: Int
     let state: State
     let targetPath: String
+    let stagedPath: String?
     let stagedDevice: UInt64
     let stagedInode: UInt64
 }
@@ -525,36 +590,63 @@ private final class RecoveryClaim: @unchecked Sendable {
 
     func committedOutput(requestedURL: URL) throws -> URL? {
         guard let marker = try readMarker() else { return nil }
-        guard marker.version == InodeFinalizationMarker.version else {
+        guard marker.version == 1 || marker.version == InodeFinalizationMarker.version else {
             throw Self.markerFailure("The working recording has an unsupported finalization marker.")
         }
         let targetURL = URL(fileURLWithPath: marker.targetPath)
-        let targetMatches = Self.path(
-            targetURL,
-            device: marker.stagedDevice,
-            inode: marker.stagedInode
-        )
-        if marker.state == .pending, !targetMatches {
-            try clearMarker()
-            return nil
+        guard targetURL.standardizedFileURL == requestedURL.standardizedFileURL else {
+            throw Self.markerFailure(
+                "The working recording is permanently bound to a different recovery target."
+            )
         }
 
-        if targetMatches,
-           targetURL.standardizedFileURL == requestedURL.standardizedFileURL {
+        if targetMatches(marker) {
             if marker.state == .pending {
-                try? writeMarker(InodeFinalizationMarker(
-                    version: marker.version,
-                    state: .finalized,
-                    targetPath: marker.targetPath,
-                    stagedDevice: marker.stagedDevice,
-                    stagedInode: marker.stagedInode
-                ))
+                do {
+                    try markCommitComplete(marker)
+                } catch {
+                    // The target inode proves commit. Keep pending bound if the
+                    // finalized marker cannot be persisted.
+                }
             }
+            cleanupTrustedStaging(marker, targetURL: targetURL)
             return targetURL
         }
-        throw Self.markerFailure(
-            "The working recording was already consumed by a prior published output."
-        )
+
+        guard marker.state == .pending else {
+            throw Self.markerFailure(
+                "The finalized recording target is missing or was replaced; the working recording remains consumed."
+            )
+        }
+        guard !Self.pathExists(targetURL) else {
+            throw Self.markerFailure(
+                "The bound recovery target was replaced by a different inode."
+            )
+        }
+        guard let stagedURL = trustedStagingURL(marker, targetURL: targetURL) else {
+            throw Self.markerFailure(
+                "The pending recovery has neither its bound target nor trusted staging; manual recovery is required."
+            )
+        }
+
+        let result = stagedURL.path.withCString { stagedPath in
+            targetURL.path.withCString { targetPath in
+                link(stagedPath, targetPath)
+            }
+        }
+        let linkError = errno
+        guard result == 0 || targetMatches(marker) else {
+            throw Self.markerFailure(
+                "Could not complete the bound recovery target: \(String(cString: strerror(linkError)))"
+            )
+        }
+        do {
+            try markCommitComplete(marker)
+        } catch {
+            // The publish link is the commit point. Pending remains bound.
+        }
+        cleanupTrustedStaging(marker, targetURL: targetURL)
+        return targetURL
     }
 
     func prepareCommit(
@@ -569,6 +661,7 @@ private final class RecoveryClaim: @unchecked Sendable {
             version: InodeFinalizationMarker.version,
             state: .pending,
             targetPath: outputURL.standardizedFileURL.path,
+            stagedPath: stagedURL.standardizedFileURL.path,
             stagedDevice: UInt64(status.st_dev),
             stagedInode: UInt64(status.st_ino)
         )
@@ -583,12 +676,57 @@ private final class RecoveryClaim: @unchecked Sendable {
 
     func markCommitComplete(_ marker: InodeFinalizationMarker) throws {
         try writeMarker(InodeFinalizationMarker(
-            version: marker.version,
+            version: InodeFinalizationMarker.version,
             state: .finalized,
             targetPath: marker.targetPath,
+            stagedPath: marker.stagedPath,
             stagedDevice: marker.stagedDevice,
             stagedInode: marker.stagedInode
         ))
+    }
+
+    func targetMatches(_ marker: InodeFinalizationMarker) -> Bool {
+        Self.path(
+            URL(fileURLWithPath: marker.targetPath),
+            device: marker.stagedDevice,
+            inode: marker.stagedInode
+        )
+    }
+
+    private func trustedStagingURL(
+        _ marker: InodeFinalizationMarker,
+        targetURL: URL
+    ) -> URL? {
+        guard let stagedPath = marker.stagedPath else { return nil }
+        let stagedURL = URL(fileURLWithPath: stagedPath).standardizedFileURL
+        let standardizedTarget = targetURL.standardizedFileURL
+        guard
+            stagedURL != standardizedTarget,
+            stagedURL.deletingLastPathComponent()
+                == standardizedTarget.deletingLastPathComponent(),
+            stagedURL.lastPathComponent.hasPrefix(
+                ".\(standardizedTarget.lastPathComponent)."
+            ),
+            stagedURL.lastPathComponent.hasSuffix(".tmp.m4a"),
+            Self.path(
+                stagedURL,
+                device: marker.stagedDevice,
+                inode: marker.stagedInode
+            )
+        else {
+            return nil
+        }
+        return stagedURL
+    }
+
+    private func cleanupTrustedStaging(
+        _ marker: InodeFinalizationMarker,
+        targetURL: URL
+    ) {
+        guard let stagedURL = trustedStagingURL(marker, targetURL: targetURL) else {
+            return
+        }
+        _ = stagedURL.path.withCString { unlink($0) }
     }
 
     func release() {
@@ -681,6 +819,11 @@ private final class RecoveryClaim: @unchecked Sendable {
             return false
         }
         return UInt64(status.st_dev) == device && UInt64(status.st_ino) == inode
+    }
+
+    private static func pathExists(_ url: URL) -> Bool {
+        var status = stat()
+        return url.path.withCString { lstat($0, &status) } == 0
     }
 
     private static func claimFailure(_ errorCode: Int32) -> RecordingFailure {

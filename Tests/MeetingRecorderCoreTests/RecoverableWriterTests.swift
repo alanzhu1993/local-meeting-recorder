@@ -574,6 +574,128 @@ final class RecoverableWriterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
     }
 
+    func testPendingMarkerPermanentlyBindsOriginalTargetAcrossFinalizerInstances() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let originalURL = directory.appendingPathComponent("original.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let interrupted = M4AFinalizer(hooks: M4AFinalizerHooks(
+            interruptAfterPendingPersisted: { true }
+        ))
+
+        do {
+            _ = try await interrupted.recover(
+                workingURL: workingURL,
+                recoveredURL: originalURL
+            )
+            XCTFail("Expected simulated interruption after pending persistence.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("Persisted pending target must reject a different target.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+
+        let completed = try await M4AFinalizer().recover(
+            workingURL: workingURL,
+            recoveredURL: originalURL
+        )
+        XCTAssertEqual(completed, originalURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+    }
+
+    func testPendingAfterLinkRejectsDifferentTargetWhenOriginalWasMoved() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let originalURL = directory.appendingPathComponent("original.m4a")
+        let movedURL = directory.appendingPathComponent("moved.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let interrupted = M4AFinalizer(hooks: M4AFinalizerHooks(
+            interruptAfterLink: { true }
+        ))
+
+        do {
+            _ = try await interrupted.recover(
+                workingURL: workingURL,
+                recoveredURL: originalURL
+            )
+            XCTFail("Expected simulated interruption after publish link.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+        try FileManager.default.moveItem(at: originalURL, to: movedURL)
+
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("A moved committed target must not permit republishing elsewhere.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+    }
+
+    func testFinalizedMarkerWriteFailureStillReturnsCommitAndRejectsDifferentTarget() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let firstURL = directory.appendingPathComponent("first.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let finalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            finalizedMarkerWrite: {
+                throw RecordingFailure(code: .finalize, message: "injected xattr fsync failure")
+            },
+            cleanupSource: { _ in
+                throw RecordingFailure(code: .finalize, message: "retain marked working")
+            }
+        ))
+
+        let output = try await finalizer.recover(
+            workingURL: workingURL,
+            recoveredURL: firstURL
+        )
+
+        XCTAssertEqual(output, firstURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("Pending marker after finalized-write failure must remain bound.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+    }
+
     private func makeTemporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("meeting-recorder-writer-tests-\(UUID().uuidString)", isDirectory: true)
