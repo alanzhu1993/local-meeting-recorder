@@ -1,7 +1,8 @@
 import Foundation
 import ServiceManagement
 
-public protocol LoginItemManaging: Sendable {
+@MainActor
+public protocol LoginItemManaging {
     var isEnabled: Bool { get }
     func setEnabled(_ enabled: Bool) throws
 }
@@ -13,7 +14,8 @@ public enum LoginItemStatus: Equatable, Sendable {
     case unavailable
 }
 
-public protocol LoginItemBacking: Sendable {
+@MainActor
+public protocol LoginItemBacking {
     func status() -> LoginItemStatus
     func register() throws
     func unregister() throws
@@ -39,9 +41,9 @@ public enum LoginItemServiceError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 
-public final class LoginItemService: LoginItemManaging, @unchecked Sendable {
+@MainActor
+public final class LoginItemService: LoginItemManaging {
     private let backend: any LoginItemBacking
-    private let lock = NSLock()
 
     public init() {
         backend = ServiceManagementLoginItemBackend()
@@ -52,39 +54,44 @@ public final class LoginItemService: LoginItemManaging, @unchecked Sendable {
     }
 
     public var isEnabled: Bool {
-        lock.withLock { backend.status() == .enabled }
+        backend.status() == .enabled
     }
 
     public func setEnabled(_ enabled: Bool) throws {
-        try lock.withLock {
-            let status = backend.status()
-            switch (enabled, status) {
-            case (_, .unavailable):
-                throw LoginItemServiceError.unavailable
-            case (true, .enabled), (false, .disabled):
-                return
-            case (true, .requiresApproval):
-                throw LoginItemServiceError.requiresApproval
-            case (true, .disabled):
-                do {
-                    try backend.register()
-                } catch {
-                    if backend.status() == .enabled { return }
+        let status = backend.status()
+        switch (enabled, status) {
+        case (_, .unavailable):
+            throw LoginItemServiceError.unavailable
+        case (true, .enabled), (false, .disabled):
+            return
+        case (true, .requiresApproval):
+            throw LoginItemServiceError.requiresApproval
+        case (true, .disabled):
+            do {
+                try backend.register()
+            } catch {
+                switch backend.status() {
+                case .enabled:
+                    return
+                case .requiresApproval:
+                    throw LoginItemServiceError.requiresApproval
+                default:
                     throw LoginItemServiceError.registrationFailed(error.localizedDescription)
                 }
-            case (false, .enabled), (false, .requiresApproval):
-                do {
-                    try backend.unregister()
-                } catch {
-                    if backend.status() == .disabled { return }
-                    throw LoginItemServiceError.unregistrationFailed(error.localizedDescription)
-                }
+            }
+        case (false, .enabled), (false, .requiresApproval):
+            do {
+                try backend.unregister()
+            } catch {
+                if backend.status() == .disabled { return }
+                throw LoginItemServiceError.unregistrationFailed(error.localizedDescription)
             }
         }
     }
 }
 
-private final class ServiceManagementLoginItemBackend: LoginItemBacking, @unchecked Sendable {
+@MainActor
+private final class ServiceManagementLoginItemBackend: LoginItemBacking {
     func status() -> LoginItemStatus {
         switch SMAppService.mainApp.status {
         case .enabled: .enabled

@@ -2,6 +2,7 @@ import XCTest
 import UserNotifications
 @testable import MeetingRecorderCore
 
+@MainActor
 final class SystemServiceTests: XCTestCase {
     func testSleepPreventionIsIdempotent() {
         let backend = SleepBackendStub()
@@ -67,12 +68,17 @@ final class SystemServiceTests: XCTestCase {
         XCTAssertEqual(backend.registerCount, 0)
     }
 
-    func testConcurrentSameLoginItemRequestIsLinearized() {
+    func testConcurrentSameLoginItemRequestIsLinearizedByMainActor() async {
         let backend = ConcurrentLoginItemBackend()
         let service = LoginItemService(backend: backend)
 
-        DispatchQueue.concurrentPerform(iterations: 20) { _ in
-            try? service.setEnabled(true)
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<20 {
+                group.addTask { @MainActor in
+                    try? service.setEnabled(true)
+                }
+            }
+            await group.waitForAll()
         }
 
         XCTAssertTrue(service.isEnabled)
@@ -87,6 +93,26 @@ final class SystemServiceTests: XCTestCase {
 
         XCTAssertTrue(service.isEnabled)
         XCTAssertEqual(backend.registerCount, 1)
+    }
+
+    func testRegistrationErrorWithRequiresApprovalIsActionable() {
+        let backend = ConcurrentLoginItemBackend(registerErrorResult: .requiresApproval)
+        let service = LoginItemService(backend: backend)
+
+        XCTAssertThrowsError(try service.setEnabled(true)) { error in
+            XCTAssertEqual(error as? LoginItemServiceError, .requiresApproval)
+        }
+    }
+
+    func testReentrantBackendCanReadAndSetLoginItemStateWithoutDeadlock() throws {
+        let backend = ReentrantLoginItemBackend()
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        try service.setEnabled(true)
+
+        XCTAssertTrue(service.isEnabled)
+        XCTAssertTrue(backend.didReenter)
     }
 
     func testOppositeLoginItemRequestsHaveLastCompletedCallSemantics() throws {
@@ -124,7 +150,8 @@ private final class NotificationBackendStub: RecordingNotificationBacking, @unch
     }
 }
 
-private final class LoginItemBackendStub: LoginItemBacking, @unchecked Sendable {
+@MainActor
+private final class LoginItemBackendStub: LoginItemBacking {
     let currentStatus: LoginItemStatus
     var registerCount = 0
 
@@ -137,36 +164,54 @@ private final class LoginItemBackendStub: LoginItemBacking, @unchecked Sendable 
     func unregister() throws {}
 }
 
-private final class ConcurrentLoginItemBackend: LoginItemBacking, @unchecked Sendable {
-    private let lock = NSLock()
+@MainActor
+private final class ConcurrentLoginItemBackend: LoginItemBacking {
     private var currentStatus: LoginItemStatus = .disabled
-    private let registerErrorAfterChangingState: Bool
+    private let registerErrorResult: LoginItemStatus?
     private(set) var registerCount = 0
     private(set) var unregisterCount = 0
 
-    init(registerErrorAfterChangingState: Bool = false) {
-        self.registerErrorAfterChangingState = registerErrorAfterChangingState
+    init(registerErrorAfterChangingState: Bool = false, registerErrorResult: LoginItemStatus? = nil) {
+        self.registerErrorResult = registerErrorAfterChangingState ? .enabled : registerErrorResult
     }
 
     func status() -> LoginItemStatus {
-        lock.withLock { currentStatus }
+        currentStatus
     }
 
     func register() throws {
-        try lock.withLock {
-            registerCount += 1
-            currentStatus = .enabled
-            if registerErrorAfterChangingState {
-                throw TestLoginError.changedState
-            }
+        registerCount += 1
+        if let registerErrorResult {
+            currentStatus = registerErrorResult
+            throw TestLoginError.changedState
         }
+        currentStatus = .enabled
     }
 
     func unregister() throws {
-        lock.withLock {
-            unregisterCount += 1
-            currentStatus = .disabled
-        }
+        unregisterCount += 1
+        currentStatus = .disabled
+    }
+}
+
+@MainActor
+private final class ReentrantLoginItemBackend: LoginItemBacking {
+    weak var service: LoginItemService?
+    private var currentStatus: LoginItemStatus = .disabled
+    private(set) var didReenter = false
+
+    func status() -> LoginItemStatus { currentStatus }
+
+    func register() throws {
+        currentStatus = .enabled
+        guard !didReenter else { return }
+        didReenter = true
+        _ = service?.isEnabled
+        try service?.setEnabled(true)
+    }
+
+    func unregister() throws {
+        currentStatus = .disabled
     }
 }
 

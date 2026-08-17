@@ -1,5 +1,4 @@
 import Carbon
-import Dispatch
 import Foundation
 
 public struct HotkeyEventID: Equatable, Sendable {
@@ -46,8 +45,10 @@ public enum HotkeyBackendError: Error, Equatable, Sendable {
     case status(OSStatus)
 }
 
-public protocol HotkeyBackend: Sendable {
-    func installEventHandler(_ handler: @escaping @Sendable (HotkeyEventID) -> OSStatus) throws -> HotkeyHandlerToken
+@MainActor
+public protocol HotkeyBackend {
+    func installEventHandler(_ handler: @escaping @MainActor @Sendable (HotkeyEventID) -> OSStatus) throws -> HotkeyHandlerToken
+    // Carbon invalidates EventHandlerRef after this call regardless of its result.
     func removeEventHandler(_ token: HotkeyHandlerToken) -> OSStatus
     func register(_ descriptor: HotkeyDescriptor, identifier: HotkeyEventID, options: UInt32) throws -> HotkeyRegistration
     func unregister(_ registration: HotkeyRegistration) -> OSStatus
@@ -68,25 +69,25 @@ public enum HotkeyServiceError: Error, Equatable, Sendable, LocalizedError {
         case .unavailable:
             "无法注册快捷键，请稍后重试或换一个组合键。"
         case .teardownFailed:
-            "快捷键尚未完全移除，请稍后重试。"
+            "快捷键移除状态无法确认。请重启应用后再设置快捷键。"
         }
     }
 }
 
-public protocol HotkeyRegistering: Sendable {
+@MainActor
+public protocol HotkeyRegistering {
     func register(_ descriptor: HotkeyDescriptor, handler: @escaping @Sendable () -> Void) throws
     func unregister()
 }
 
-public final class HotkeyService: HotkeyRegistering, @unchecked Sendable {
+@MainActor
+public final class HotkeyService: HotkeyRegistering {
     public let eventIdentifier: HotkeyEventID
+    public private(set) var lastTeardownError: HotkeyServiceError?
 
     private let backend: any HotkeyBackend
-    private let state = HotkeyRegistrationState()
-
-    public var lastTeardownError: HotkeyServiceError? {
-        MainEventThreadExecutor.sync { state.lastTeardownError }
-    }
+    private var resources: Resources?
+    private var terminalTeardownError: HotkeyServiceError?
 
     public init() {
         backend = CarbonHotkeyBackend()
@@ -98,57 +99,61 @@ public final class HotkeyService: HotkeyRegistering, @unchecked Sendable {
         eventIdentifier = HotkeyIdentifierFactory.next()
     }
 
-    deinit {
-        unregister()
-    }
-
     public func register(_ descriptor: HotkeyDescriptor, handler: @escaping @Sendable () -> Void) throws {
-        try MainEventThreadExecutor.sync {
-            guard state.resources == nil else { throw HotkeyServiceError.alreadyRegistered }
+        if let terminalTeardownError {
+            throw terminalTeardownError
+        }
+        guard resources == nil else { throw HotkeyServiceError.alreadyRegistered }
 
-            let handlerToken = try backend.installEventHandler { [state, eventIdentifier] identifier in
-                state.dispatch(identifier, expected: eventIdentifier)
+        let handlerToken = try backend.installEventHandler { [weak self] identifier in
+            guard let self, identifier == self.eventIdentifier, let callback = self.resources?.handler else {
+                return OSStatus(eventNotHandledErr)
             }
-            do {
-                let registration = try backend.register(
-                    descriptor,
-                    identifier: eventIdentifier,
-                    options: UInt32(kEventHotKeyExclusive)
-                )
-                state.resources = .init(handlerToken: handlerToken, registration: registration, handler: handler)
-                state.lastTeardownError = nil
-            } catch {
-                let removalStatus = backend.removeEventHandler(handlerToken)
-                if removalStatus != noErr {
-                    state.resources = .init(handlerToken: handlerToken, registration: nil, handler: handler)
-                    state.lastTeardownError = .teardownFailed(removalStatus)
-                }
-                throw Self.mapError(error)
-            }
+            callback()
+            return noErr
+        }
+        do {
+            let registration = try backend.register(
+                descriptor,
+                identifier: eventIdentifier,
+                options: UInt32(kEventHotKeyExclusive)
+            )
+            resources = Resources(handlerToken: handlerToken, registration: registration, handler: handler)
+            lastTeardownError = nil
+        } catch {
+            consumeHandlerRef(handlerToken)
+            throw Self.mapError(error)
         }
     }
 
     public func unregister() {
-        MainEventThreadExecutor.sync {
-            guard var resources = state.resources else { return }
-            if let registration = resources.registration, !resources.registrationRemoved {
-                let unregisterStatus = backend.unregister(registration)
-                guard unregisterStatus == noErr else {
-                    state.lastTeardownError = .teardownFailed(unregisterStatus)
-                    return
-                }
-                resources.registrationRemoved = true
-                state.resources = resources
-            }
-
-            let removalStatus = backend.removeEventHandler(resources.handlerToken)
-            guard removalStatus == noErr else {
-                state.lastTeardownError = .teardownFailed(removalStatus)
-                return
-            }
-            state.resources = nil
-            state.lastTeardownError = nil
+        guard let resources else { return }
+        let unregisterStatus = backend.unregister(resources.registration)
+        guard unregisterStatus == noErr else {
+            lastTeardownError = .teardownFailed(unregisterStatus)
+            return
         }
+
+        self.resources = nil
+        consumeHandlerRef(resources.handlerToken)
+    }
+
+    private func consumeHandlerRef(_ token: HotkeyHandlerToken) {
+        let removalStatus = backend.removeEventHandler(token)
+        guard removalStatus != noErr else {
+            lastTeardownError = nil
+            return
+        }
+
+        retainContextForTerminalFailure(token)
+        let error = HotkeyServiceError.teardownFailed(removalStatus)
+        lastTeardownError = error
+        terminalTeardownError = error
+    }
+
+    private func retainContextForTerminalFailure(_ token: HotkeyHandlerToken) {
+        guard let storage = token.storage as? CarbonHotkeyHandlerStorage else { return }
+        CarbonCallbackLifetime.shared.retain(storage.context)
     }
 
     private static func mapError(_ error: Error) -> HotkeyServiceError {
@@ -162,59 +167,37 @@ public final class HotkeyService: HotkeyRegistering, @unchecked Sendable {
             return .unavailable(status)
         }
     }
-}
 
-private enum MainEventThreadExecutor {
-    static func sync<T>(_ body: () throws -> T) rethrows -> T {
-        if Thread.isMainThread {
-            return try body()
-        }
-        return try DispatchQueue.main.sync(execute: body)
+    private struct Resources {
+        let handlerToken: HotkeyHandlerToken
+        let registration: HotkeyRegistration
+        let handler: @Sendable () -> Void
     }
 }
 
+@MainActor
 private enum HotkeyIdentifierFactory {
-    private static let generator = HotkeyIdentifierGenerator()
+    private static var nextIdentifier: UInt32 = 1
 
     static func next() -> HotkeyEventID {
-        generator.next()
+        defer { nextIdentifier &+= 1 }
+        return HotkeyEventID(signature: 0x4D52_4352, identifier: nextIdentifier)
     }
 }
 
-private final class HotkeyIdentifierGenerator: @unchecked Sendable {
-    private let lock = NSLock()
-    private var nextIdentifier: UInt32 = 1
+@MainActor
+private final class CarbonCallbackLifetime {
+    static let shared = CarbonCallbackLifetime()
+    private var retainedContexts: [CarbonHotkeyCallbackContext] = []
 
-    func next() -> HotkeyEventID {
-        lock.withLock {
-            defer { nextIdentifier &+= 1 }
-            return HotkeyEventID(signature: 0x4D52_4352, identifier: nextIdentifier)
-        }
+    func retain(_ context: CarbonHotkeyCallbackContext) {
+        retainedContexts.append(context)
     }
 }
 
-private final class HotkeyRegistrationState: @unchecked Sendable {
-    struct Resources {
-        let handlerToken: HotkeyHandlerToken
-        let registration: HotkeyRegistration?
-        let handler: @Sendable () -> Void
-        var registrationRemoved = false
-    }
-
-    var resources: Resources?
-    var lastTeardownError: HotkeyServiceError?
-
-    func dispatch(_ identifier: HotkeyEventID, expected: HotkeyEventID) -> OSStatus {
-        guard identifier == expected, let handler = resources?.handler else {
-            return OSStatus(eventNotHandledErr)
-        }
-        handler()
-        return noErr
-    }
-}
-
-private final class CarbonHotkeyBackend: HotkeyBackend, @unchecked Sendable {
-    func installEventHandler(_ handler: @escaping @Sendable (HotkeyEventID) -> OSStatus) throws -> HotkeyHandlerToken {
+@MainActor
+private final class CarbonHotkeyBackend: HotkeyBackend {
+    func installEventHandler(_ handler: @escaping @MainActor @Sendable (HotkeyEventID) -> OSStatus) throws -> HotkeyHandlerToken {
         let context = CarbonHotkeyCallbackContext(handler: handler)
         let userData = Unmanaged.passUnretained(context).toOpaque()
         var eventType = EventTypeSpec(
@@ -265,17 +248,15 @@ private final class CarbonHotkeyBackend: HotkeyBackend, @unchecked Sendable {
 }
 
 private final class CarbonHotkeyCallbackContext: @unchecked Sendable {
-    let handler: @Sendable (HotkeyEventID) -> OSStatus
+    let handler: @MainActor @Sendable (HotkeyEventID) -> OSStatus
 
-    init(handler: @escaping @Sendable (HotkeyEventID) -> OSStatus) {
+    init(handler: @escaping @MainActor @Sendable (HotkeyEventID) -> OSStatus) {
         self.handler = handler
     }
 }
 
 private final class CarbonHotkeyHandlerStorage {
     let ref: EventHandlerRef
-    // This strong reference outlives raw userData. Carbon API calls and callback
-    // dispatch are all on the main event thread, so removal cannot race a callback.
     let context: CarbonHotkeyCallbackContext
 
     init(ref: EventHandlerRef, context: CarbonHotkeyCallbackContext) {
@@ -314,5 +295,9 @@ private func carbonHotkeyCallback(
     )
     guard status == noErr else { return status }
     let context = Unmanaged<CarbonHotkeyCallbackContext>.fromOpaque(userData).takeUnretainedValue()
-    return context.handler(HotkeyEventID(signature: UInt32(eventID.signature), identifier: eventID.id))
+    // GetEventDispatcherTarget dispatches on the AppKit main event thread. The service,
+    // Carbon operations and this callback therefore share MainActor isolation.
+    return MainActor.assumeIsolated {
+        context.handler(HotkeyEventID(signature: UInt32(eventID.signature), identifier: eventID.id))
+    }
 }
