@@ -696,6 +696,168 @@ final class RecoverableWriterTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
     }
 
+    func testStagingReplacementBetweenVerificationAndLinkCannotCommitWrongInode() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let originalURL = directory.appendingPathComponent("original.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let displacedStagingURL = directory.appendingPathComponent("displaced-staging.m4a")
+        let replacement = Data("not the verified staged recording".utf8)
+        let observedStaging = TestURLBox()
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let finalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            afterStagingVerifiedBeforeLink: { stagingURL in
+                observedStaging.set(stagingURL)
+                try FileManager.default.moveItem(
+                    at: stagingURL,
+                    to: displacedStagingURL
+                )
+                try replacement.write(to: stagingURL)
+            }
+        ))
+
+        do {
+            _ = try await finalizer.recover(
+                workingURL: workingURL,
+                recoveredURL: originalURL
+            )
+            XCTFail("A link of a replacement inode must not be reported as committed.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+
+        let stagingURL = try XCTUnwrap(observedStaging.value)
+        XCTAssertEqual(try Data(contentsOf: stagingURL), replacement)
+        XCTAssertEqual(try Data(contentsOf: originalURL), replacement)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("The pending marker must remain bound to the original target.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+    }
+
+    func testPendingRecoveryRechecksTargetAfterStagingPathIsReplaced() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let originalURL = directory.appendingPathComponent("original.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let displacedStagingURL = directory.appendingPathComponent("displaced-staging.m4a")
+        let replacement = Data("pending recovery replacement".utf8)
+        let observedStaging = TestURLBox()
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let interrupted = M4AFinalizer(hooks: M4AFinalizerHooks(
+            interruptAfterPendingPersisted: { true }
+        ))
+        do {
+            _ = try await interrupted.recover(
+                workingURL: workingURL,
+                recoveredURL: originalURL
+            )
+            XCTFail("Expected simulated interruption after pending persistence.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+
+        let retry = M4AFinalizer(hooks: M4AFinalizerHooks(
+            afterStagingVerifiedBeforeLink: { stagingURL in
+                observedStaging.set(stagingURL)
+                try FileManager.default.moveItem(
+                    at: stagingURL,
+                    to: displacedStagingURL
+                )
+                try replacement.write(to: stagingURL)
+            }
+        ))
+        do {
+            _ = try await retry.recover(
+                workingURL: workingURL,
+                recoveredURL: originalURL
+            )
+            XCTFail("A pending retry must reject the linked replacement inode.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+
+        let stagingURL = try XCTUnwrap(observedStaging.value)
+        XCTAssertEqual(try Data(contentsOf: stagingURL), replacement)
+        XCTAssertEqual(try Data(contentsOf: originalURL), replacement)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("A failed same-target retry must retain its original binding.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+    }
+
+    func testStagingReplacementBetweenVerificationAndCleanupIsNotDeleted() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let originalURL = directory.appendingPathComponent("original.m4a")
+        let differentURL = directory.appendingPathComponent("different.m4a")
+        let displacedStagingURL = directory.appendingPathComponent("displaced-staging.m4a")
+        let replacement = Data("replacement must survive cleanup".utf8)
+        let observedStaging = TestURLBox()
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let finalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            afterStagingVerifiedBeforeCleanup: { stagingURL in
+                observedStaging.set(stagingURL)
+                try FileManager.default.moveItem(
+                    at: stagingURL,
+                    to: displacedStagingURL
+                )
+                try replacement.write(to: stagingURL)
+            },
+            cleanupSource: { _ in
+                throw RecordingFailure(code: .finalize, message: "retain marked working")
+            }
+        ))
+
+        let output = try await finalizer.recover(
+            workingURL: workingURL,
+            recoveredURL: originalURL
+        )
+
+        let stagingURL = try XCTUnwrap(observedStaging.value)
+        XCTAssertEqual(output, originalURL)
+        XCTAssertNotEqual(try Data(contentsOf: originalURL), replacement)
+        XCTAssertEqual(try Data(contentsOf: stagingURL), replacement)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: differentURL
+            )
+            XCTFail("Cleanup contention must not clear or rebind the marker.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: differentURL.path))
+        XCTAssertEqual(try Data(contentsOf: stagingURL), replacement)
+    }
+
     private func makeTemporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("meeting-recorder-writer-tests-\(UUID().uuidString)", isDirectory: true)
@@ -777,6 +939,23 @@ private final class TestSignal: @unchecked Sendable {
 
     func wait() -> Bool {
         semaphore.wait(timeout: .now() + 2) == .success
+    }
+}
+
+private final class TestURLBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: URL?
+
+    var value: URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func set(_ value: URL) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
     }
 }
 
