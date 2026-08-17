@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct RecordingPaths: Equatable, Sendable {
@@ -28,7 +29,7 @@ public actor RecordingStore {
     private let root: URL
     private let timeZone: TimeZone
     private let availableCapacity: @Sendable () -> Int64
-    private var reservedURLs: Set<URL> = []
+    private var reservationDescriptors: [URL: Int32] = [:]
 
     public init(
         root: URL = AppMetadata.defaultRecordingRoot,
@@ -46,6 +47,12 @@ public actor RecordingStore {
         }
     }
 
+    deinit {
+        for descriptor in reservationDescriptors.values {
+            _ = close(descriptor)
+        }
+    }
+
     public func prepare(startedAt: Date) throws -> RecordingPaths {
         guard availableCapacity() >= Self.minimumFreeBytes else {
             throw RecordingFailure(code: .storage, message: "可用空间不足 1 GB，未开始录音。")
@@ -54,14 +61,16 @@ public actor RecordingStore {
         let folder = format(startedAt, pattern: "yyyy-MM-dd")
         let stamp = format(startedAt, pattern: "yyyy-MM-dd-HH-mm-ss")
         let directory = root.appendingPathComponent(folder, isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            throw RecordingFailure(code: .write, message: "无法创建录音目录：\(error.localizedDescription)")
+        }
 
-        let (finalURL, workingURL) = uniqueRecordingURLs(
+        let (finalURL, workingURL) = try uniqueRecordingURLs(
             directory: directory,
             base: "会议录音-\(stamp)"
         )
-        reservedURLs.insert(finalURL)
-        reservedURLs.insert(workingURL)
         let base = finalURL.deletingPathExtension().lastPathComponent
         return RecordingPaths(
             startedAt: startedAt,
@@ -90,8 +99,7 @@ public actor RecordingStore {
             guard values.isRegularFile == true else {
                 continue
             }
-            let name = fileURL.lastPathComponent
-            guard name.hasPrefix("."), name.hasSuffix(".inprogress.mov") else {
+            guard (try? workingFileBase(for: fileURL)) != nil else {
                 continue
             }
             interrupted.append(fileURL)
@@ -101,27 +109,22 @@ public actor RecordingStore {
     }
 
     public func recoveredURL(for workingURL: URL) throws -> URL {
-        guard isWithinRoot(workingURL) else {
-            throw RecordingFailure(code: .write, message: "中断录音文件不在录音目录中。")
-        }
-
-        var base = workingURL.lastPathComponent
-        guard base.hasPrefix("."), base.hasSuffix(".inprogress.mov") else {
-            throw RecordingFailure(code: .write, message: "中断录音文件名无效。")
-        }
-        base.removeFirst()
-        base.removeLast(".inprogress.mov".count)
-        guard !base.isEmpty else {
-            throw RecordingFailure(code: .write, message: "中断录音文件名无效。")
-        }
-
-        let recoveredURL = uniqueURL(
+        let base = try workingFileBase(for: workingURL)
+        return try uniqueURL(
             directory: workingURL.deletingLastPathComponent(),
             base: "\(base)-未完整恢复",
             pathExtension: "m4a"
         )
-        reservedURLs.insert(recoveredURL)
-        return recoveredURL
+    }
+
+    /// Call after the writer has created its working file, or when preparation is cancelled.
+    public func releaseReservation(for outputURL: URL) {
+        guard let descriptor = reservationDescriptors.removeValue(forKey: outputURL) else {
+            return
+        }
+        try? FileManager.default.removeItem(at: reservationURL(for: outputURL))
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
     }
 
     private func format(_ date: Date, pattern: String) -> String {
@@ -133,43 +136,188 @@ public actor RecordingStore {
         return formatter.string(from: date)
     }
 
-    private func uniqueURL(directory: URL, base: String, pathExtension: String) -> URL {
+    private func uniqueURL(directory: URL, base: String, pathExtension: String) throws -> URL {
         var suffix = 1
         while true {
             let name = suffix == 1 ? base : "\(base)-\(suffix)"
             let candidate = directory
                 .appendingPathComponent(name)
                 .appendingPathExtension(pathExtension)
-            if !FileManager.default.fileExists(atPath: candidate.path), !reservedURLs.contains(candidate) {
-                return candidate
+            guard !FileManager.default.fileExists(atPath: candidate.path) else {
+                suffix += 1
+                continue
             }
-            suffix += 1
+
+            switch try reserve(candidate) {
+            case .reserved:
+                if !FileManager.default.fileExists(atPath: candidate.path) {
+                    return candidate
+                }
+                releaseReservation(for: candidate)
+                suffix += 1
+            case .reclaimed:
+                continue
+            case .occupied:
+                suffix += 1
+            }
         }
     }
 
-    private func uniqueRecordingURLs(directory: URL, base: String) -> (finalURL: URL, workingURL: URL) {
+    private func uniqueRecordingURLs(directory: URL, base: String) throws -> (finalURL: URL, workingURL: URL) {
         var suffix = 1
         while true {
             let name = suffix == 1 ? base : "\(base)-\(suffix)"
             let finalURL = directory.appendingPathComponent(name).appendingPathExtension("m4a")
             let workingURL = directory.appendingPathComponent(".\(name).inprogress.mov")
-            if
+            guard
                 !FileManager.default.fileExists(atPath: finalURL.path),
-                !FileManager.default.fileExists(atPath: workingURL.path),
-                !reservedURLs.contains(finalURL),
-                !reservedURLs.contains(workingURL)
-            {
-                return (finalURL, workingURL)
+                !FileManager.default.fileExists(atPath: workingURL.path)
+            else {
+                suffix += 1
+                continue
             }
-            suffix += 1
+
+            switch try reserve(finalURL) {
+            case .reserved:
+                if
+                    !FileManager.default.fileExists(atPath: finalURL.path),
+                    !FileManager.default.fileExists(atPath: workingURL.path)
+                {
+                    return (finalURL, workingURL)
+                }
+                releaseReservation(for: finalURL)
+                suffix += 1
+            case .reclaimed:
+                continue
+            case .occupied:
+                suffix += 1
+            }
         }
     }
 
+    private enum ReservationResult {
+        case reserved
+        case occupied
+        case reclaimed
+    }
+
+    private func reserve(_ outputURL: URL) throws -> ReservationResult {
+        let reservationURL = reservationURL(for: outputURL)
+        let descriptor = reservationURL.path.withCString {
+            open($0, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        }
+        if descriptor != -1 {
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                let errorCode = errno
+                _ = close(descriptor)
+                throw reservationFailure(errorCode)
+            }
+            reservationDescriptors[outputURL] = descriptor
+            return .reserved
+        }
+
+        let errorCode = errno
+        guard errorCode == EEXIST else {
+            throw reservationFailure(errorCode)
+        }
+        return try reclaimIfStale(reservationURL)
+    }
+
+    private func reclaimIfStale(_ reservationURL: URL) throws -> ReservationResult {
+        let descriptor = reservationURL.path.withCString { open($0, O_RDWR) }
+        guard descriptor != -1 else {
+            let errorCode = errno
+            if errorCode == ENOENT {
+                return .reclaimed
+            }
+            throw reservationFailure(errorCode)
+        }
+
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let errorCode = errno
+            _ = close(descriptor)
+            if errorCode == EWOULDBLOCK || errorCode == EAGAIN {
+                return .occupied
+            }
+            throw reservationFailure(errorCode)
+        }
+
+        defer {
+            _ = flock(descriptor, LOCK_UN)
+            _ = close(descriptor)
+        }
+        do {
+            try FileManager.default.removeItem(at: reservationURL)
+        } catch {
+            throw RecordingFailure(code: .write, message: "无法清理过期预留：\(error.localizedDescription)")
+        }
+        return .reclaimed
+    }
+
+    private func reservationFailure(_ errorCode: Int32) -> RecordingFailure {
+        let reason = String(cString: strerror(errorCode))
+        return RecordingFailure(code: .write, message: "无法预留录音文件：\(reason)")
+    }
+
+    private func reservationURL(for outputURL: URL) -> URL {
+        let base = outputURL.deletingPathExtension().lastPathComponent
+        return outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(base).reservation")
+    }
+
+    private func workingFileBase(for workingURL: URL) throws -> String {
+        guard isWithinRoot(workingURL) else {
+            throw RecordingFailure(code: .write, message: "中断录音文件不在录音目录中。")
+        }
+
+        let name = workingURL.lastPathComponent
+        let range = NSRange(name.startIndex..., in: name)
+        let expression = try! NSRegularExpression(
+            pattern: "^\\.会议录音-([0-9]{4}-[0-9]{2}-[0-9]{2})-(?:[01][0-9]|2[0-3])-(?:[0-5][0-9])-(?:[0-5][0-9])(?:-([1-9][0-9]*))?\\.inprogress\\.mov$"
+        )
+        guard let match = expression.firstMatch(in: name, range: range), match.range == range else {
+            throw RecordingFailure(code: .write, message: "中断录音文件名或日期目录无效。")
+        }
+
+        let dateDirectoryName = (name as NSString).substring(with: match.range(at: 1))
+        let directory = workingURL.deletingLastPathComponent()
+        guard
+            directory.lastPathComponent == dateDirectoryName,
+            isValidDateDirectoryName(dateDirectoryName),
+            isDirectChildOfRoot(directory)
+        else {
+            throw RecordingFailure(code: .write, message: "中断录音文件名或日期目录无效。")
+        }
+
+        return String(name.dropFirst().dropLast(".inprogress.mov".count))
+    }
+
+    private func isValidDateDirectoryName(_ name: String) -> Bool {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.isLenient = false
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let date = formatter.date(from: name) else {
+            return false
+        }
+        return formatter.string(from: date) == name
+    }
+
     private func isWithinRoot(_ url: URL) -> Bool {
-        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
-        let candidatePath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let rootPath = normalizedPath(for: root)
+        let candidatePath = normalizedPath(for: url)
         let rootPrefix = rootPath.hasSuffix("/") ? rootPath : "\(rootPath)/"
         return candidatePath.hasPrefix(rootPrefix)
+    }
+
+    private func isDirectChildOfRoot(_ url: URL) -> Bool {
+        normalizedPath(for: url.deletingLastPathComponent()) == normalizedPath(for: root)
+    }
+
+    private func normalizedPath(for url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     private nonisolated static func systemAvailableCapacity(for root: URL) -> Int64 {
