@@ -62,9 +62,7 @@ public final class LoginItemService: LoginItemManaging {
 
     public func setEnabled(_ enabled: Bool) throws {
         if isMutating {
-            if activeDesired != enabled {
-                pendingDesired = enabled
-            }
+            pendingDesired = activeDesired == enabled ? nil : enabled
             return
         }
 

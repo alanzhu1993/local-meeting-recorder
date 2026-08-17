@@ -54,3 +54,10 @@
 - 每次 register/unregister 后均重新读取完整状态：`enabled` / `disabled` 代表目标达成，`requiresApproval` / `unavailable` 映射为对应具体错误，动作已抛错但目标已达成仍视为成功。
 - 新增测试覆盖注册后释放、释放时 Remove 失败的安全回调与单次移除、状态未变化前同目标重入、启用中重入停用、成功但最终 unavailable，以及既有 requiresApproval 路径。
 - 本轮验证：`PermissionServiceTests` 3/3、`HotkeyServiceTests` 10/10、`SystemServiceTests` 12/12；全量 `swift test -Xswiftc -warnings-as-errors` 为 96/96 通过，`git diff --check` 通过。
+
+## Fix Round 4（2026-08-17）
+
+- 登录启动重入分支现在会在每次请求时重新计算 `pendingDesired`：最新请求与正在执行的目标相反时保存为 pending；最新请求重新等于正在执行的目标时清掉旧 pending。这样启用中的 `停用 → 启用` 不会再执行过期的 unregister，停用中的 `启用 → 停用` 也不会执行过期的 register，双向都遵循最后一次请求。
+- 明确错误返回规则：被后续 pending 请求取代的旧动作错误不决定外层返回值；若最后目标已经达成则成功，若最后目标失败则返回最后动作对应的具体错误。测试覆盖旧 register 报错后最终停用成功、最终停用普通失败返回 `.unregistrationFailed`，以及最终状态分别落到 `requiresApproval`、`unavailable`，确认具体系统状态不会被旧错误覆盖或静默吞掉。
+- 新增确定性 backend 脚本测试覆盖两组双重反向重入和四组 active-error/pending 结果；Round 3 的单次同向、单次反向重入用例继续通过。
+- 本轮验证：三组 focused 分别为 2/2、4/4、2/2；`SystemServiceTests` 18/18；全量 `swift test -Xswiftc -warnings-as-errors` 为 102/102 通过；`git diff --check` 通过。

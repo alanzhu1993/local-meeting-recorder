@@ -128,6 +128,115 @@ final class SystemServiceTests: XCTestCase {
         XCTAssertEqual(backend.unregisterCount, 1)
     }
 
+    func testLatestEnableReentryCancelsPendingDisableWhileEnabling() throws {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .disabled,
+            registerReentries: [false, true],
+            registerFinalStatus: .enabled
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        try service.setEnabled(true)
+
+        XCTAssertTrue(service.isEnabled)
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 0)
+    }
+
+    func testLatestDisableReentryCancelsPendingEnableWhileDisabling() throws {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .enabled,
+            unregisterReentries: [true, false],
+            unregisterFinalStatus: .disabled
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        try service.setEnabled(false)
+
+        XCTAssertFalse(service.isEnabled)
+        XCTAssertEqual(backend.registerCount, 0)
+        XCTAssertEqual(backend.unregisterCount, 1)
+    }
+
+    func testPendingSuccessSupersedesActiveActionError() throws {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .disabled,
+            registerReentries: [false],
+            registerFinalStatus: .disabled,
+            registerThrows: true
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        try service.setEnabled(true)
+
+        XCTAssertFalse(service.isEnabled)
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 0)
+    }
+
+    func testPendingRequiresApprovalSupersedesActiveActionError() {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .disabled,
+            registerReentries: [false],
+            registerFinalStatus: .enabled,
+            unregisterFinalStatus: .requiresApproval,
+            registerThrows: true,
+            unregisterThrows: true
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        XCTAssertThrowsError(try service.setEnabled(true)) { error in
+            XCTAssertEqual(error as? LoginItemServiceError, .requiresApproval)
+        }
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 1)
+    }
+
+    func testPendingFailureSupersedesActiveActionError() {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .disabled,
+            registerReentries: [false],
+            registerFinalStatus: .enabled,
+            unregisterFinalStatus: .enabled,
+            registerThrows: true,
+            unregisterThrows: true
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        XCTAssertThrowsError(try service.setEnabled(true)) { error in
+            XCTAssertEqual(
+                error as? LoginItemServiceError,
+                .unregistrationFailed("系统已处理请求，但未返回确认。")
+            )
+        }
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 1)
+    }
+
+    func testPendingUnavailableSupersedesActiveActionError() {
+        let backend = SequencedReentrantLoginItemBackend(
+            initialStatus: .disabled,
+            registerReentries: [false],
+            registerFinalStatus: .enabled,
+            unregisterFinalStatus: .unavailable,
+            registerThrows: true,
+            unregisterThrows: true
+        )
+        let service = LoginItemService(backend: backend)
+        backend.service = service
+
+        XCTAssertThrowsError(try service.setEnabled(true)) { error in
+            XCTAssertEqual(error as? LoginItemServiceError, .unavailable)
+        }
+        XCTAssertEqual(backend.registerCount, 1)
+        XCTAssertEqual(backend.unregisterCount, 1)
+    }
+
     func testSuccessfulRegistrationWithUnavailableFinalStatusReturnsSpecificError() {
         let backend = ConcurrentLoginItemBackend(registerSuccessStatus: .unavailable)
         let service = LoginItemService(backend: backend)
@@ -259,6 +368,66 @@ private final class ReentrantLoginItemBackend: LoginItemBacking {
     func unregister() throws {
         unregisterCount += 1
         currentStatus = .disabled
+    }
+}
+
+@MainActor
+private final class SequencedReentrantLoginItemBackend: LoginItemBacking {
+    weak var service: LoginItemService?
+    private var currentStatus: LoginItemStatus
+    private let registerReentries: [Bool]
+    private let unregisterReentries: [Bool]
+    private let registerFinalStatus: LoginItemStatus
+    private let unregisterFinalStatus: LoginItemStatus
+    private let registerThrows: Bool
+    private let unregisterThrows: Bool
+    private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
+
+    init(
+        initialStatus: LoginItemStatus,
+        registerReentries: [Bool] = [],
+        unregisterReentries: [Bool] = [],
+        registerFinalStatus: LoginItemStatus = .enabled,
+        unregisterFinalStatus: LoginItemStatus = .disabled,
+        registerThrows: Bool = false,
+        unregisterThrows: Bool = false
+    ) {
+        currentStatus = initialStatus
+        self.registerReentries = registerReentries
+        self.unregisterReentries = unregisterReentries
+        self.registerFinalStatus = registerFinalStatus
+        self.unregisterFinalStatus = unregisterFinalStatus
+        self.registerThrows = registerThrows
+        self.unregisterThrows = unregisterThrows
+    }
+
+    func status() -> LoginItemStatus { currentStatus }
+
+    func register() throws {
+        registerCount += 1
+        if registerCount == 1 {
+            for desired in registerReentries {
+                try service?.setEnabled(desired)
+            }
+        }
+        currentStatus = registerFinalStatus
+        if registerThrows {
+            throw TestLoginError.changedState
+        }
+    }
+
+    func unregister() throws {
+        unregisterCount += 1
+        if unregisterCount == 1 {
+            for desired in unregisterReentries {
+                try service?.setEnabled(desired)
+            }
+        }
+        currentStatus = unregisterFinalStatus
+        if unregisterThrows {
+            throw TestLoginError.changedState
+        }
     }
 }
 
