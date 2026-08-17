@@ -90,10 +90,22 @@ public actor ScreenCaptureEngine: AudioCapturing {
         lifecycle = .starting(session)
 
         do {
-            try await session.startTask.value
+            try await withTaskCancellationHandler {
+                try await session.startTask.value
+            } onCancel: {
+                session.startTask.cancel()
+            }
+            try Task.checkCancellation()
+            guard owns(session, in: lifecycle, phase: .starting) else {
+                throw CancellationError()
+            }
+            lifecycle = .running(session)
+            try Task.checkCancellation()
         } catch {
+            let wasCancelled = error is CancellationError || Task.isCancelled
             let failure = Self.failure(from: error, fallbackCode: .capture)
-            if owns(session, in: lifecycle, phase: .starting) {
+            if owns(session, in: lifecycle, phase: .starting)
+                || owns(session, in: lifecycle, phase: .running) {
                 lifecycle = .stopping(session)
                 let cleanup = beginStopping(session)
                 _ = await cleanup.value
@@ -102,16 +114,11 @@ public actor ScreenCaptureEngine: AudioCapturing {
                     session.delivery.finish()
                 }
             }
+            if wasCancelled {
+                throw CancellationError()
+            }
             throw failure
         }
-
-        guard owns(session, in: lifecycle, phase: .starting) else {
-            throw RecordingFailure(
-                code: .capture,
-                message: "Audio capture start was cancelled before it became active."
-            )
-        }
-        lifecycle = .running(session)
     }
 
     public func stop() async {

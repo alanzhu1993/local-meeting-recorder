@@ -83,6 +83,41 @@ final class ScreenCaptureEngineTests: XCTestCase {
         XCTAssertEqual(second.startCallCount, 1)
     }
 
+    func testCancellingStartCallerCleansSessionAndAllowsRestart() async throws {
+        let first = TestBackendControl(suspendsStart: true)
+        let second = TestBackendControl()
+        let factory = TestBackendFactory([first, second])
+        let engine = ScreenCaptureEngine(backendFactory: factory.make)
+        let cancelledSessionEvents = TestEventRecorder()
+
+        let cancelledStart = Task {
+            try await engine.start { event in
+                await cancelledSessionEvents.record(event)
+            }
+        }
+        await first.waitUntilStartEntered()
+
+        cancelledStart.cancel()
+        first.openStartGate()
+        let result = await cancelledStart.result
+        if case .success = result {
+            XCTFail("A cancelled start caller must not leave capture running.")
+            await engine.stop()
+        }
+        if case let .failure(error) = result {
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        try await engine.start { _ in }
+        await engine.stop()
+
+        let cancelledStoppedEvents = await cancelledSessionEvents.stoppedEventCount
+        XCTAssertEqual(first.startCancellationCount, 1)
+        XCTAssertEqual(first.stopCallCount, 1)
+        XCTAssertEqual(second.startCallCount, 1)
+        XCTAssertEqual(cancelledStoppedEvents, 0)
+    }
+
     func testUnexpectedStopCleansUpOnceAndAllowsRestart() async throws {
         let first = TestBackendControl()
         let second = TestBackendControl()
@@ -220,6 +255,7 @@ private final class TestBackendControl: @unchecked Sendable {
     private let stopGate = TestAsyncGate()
     private var eventHandler: (@Sendable (AudioCaptureEvent) async -> Void)?
     private var _startCallCount = 0
+    private var _startCancellationCount = 0
     private var _stopCallCount = 0
 
     init(suspendsStart: Bool = false, suspendsStop: Bool = false) {
@@ -233,6 +269,10 @@ private final class TestBackendControl: @unchecked Sendable {
 
     var stopCallCount: Int {
         lock.withLock { _stopCallCount }
+    }
+
+    var startCancellationCount: Int {
+        lock.withLock { _startCancellationCount }
     }
 
     func waitUntilStartEntered() async {
@@ -279,6 +319,7 @@ private final class TestBackendControl: @unchecked Sendable {
         await withTaskCancellationHandler {
             await startGate.wait()
         } onCancel: {
+            self.lock.withLock { self._startCancellationCount += 1 }
             self.startCancelled.continuation.yield()
         }
         try Task.checkCancellation()
