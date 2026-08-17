@@ -38,18 +38,37 @@ private struct DualCaptureArguments {
 }
 
 private struct RecordUntilKilledArguments {
+    enum Strategy: String {
+        case fragmented
+        case segmented
+    }
+
     let workingURL: URL
+    let strategy: Strategy
 
     init?(_ arguments: [String]) {
-        guard
-            arguments.count == 3,
-            arguments[0] == "record-until-killed",
-            arguments[1] == "--working",
-            !arguments[2].isEmpty
-        else {
-            return nil
+        guard arguments.first == "record-until-killed" else { return nil }
+        var workingPath: String?
+        var strategy = Strategy.fragmented
+        var index = 1
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--working" where index + 1 < arguments.count:
+                workingPath = arguments[index + 1]
+                index += 2
+            case "--strategy" where index + 1 < arguments.count:
+                guard let parsed = Strategy(rawValue: arguments[index + 1]) else {
+                    return nil
+                }
+                strategy = parsed
+                index += 2
+            default:
+                return nil
+            }
         }
-        workingURL = URL(fileURLWithPath: arguments[2])
+        guard let workingPath, !workingPath.isEmpty else { return nil }
+        workingURL = URL(fileURLWithPath: workingPath)
+        self.strategy = strategy
     }
 }
 
@@ -262,9 +281,18 @@ private func sineChunk(startFrame: Int64, frameCount: Int) -> MixedAudioChunk {
 }
 
 private func runUntilKilled(_ arguments: RecordUntilKilledArguments) async throws -> Never {
-    let writer = FragmentedMOVWriter(workingURL: arguments.workingURL)
+    let writer: any RecoverableAudioWriting
+    switch arguments.strategy {
+    case .fragmented:
+        writer = FragmentedMOVWriter(workingURL: arguments.workingURL)
+    case .segmented:
+        writer = SegmentedM4AWriter(workingURL: arguments.workingURL)
+    }
     try await writer.start()
-    print("ready pid=\(ProcessInfo.processInfo.processIdentifier) signal=TERM")
+    print(
+        "ready pid=\(ProcessInfo.processInfo.processIdentifier) "
+            + "signal=TERM strategy=\(arguments.strategy.rawValue)"
+    )
     fflush(stdout)
 
     let framesPerChunk = 960
@@ -385,7 +413,8 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 if arguments.first == "record-until-killed" {
     guard let recordArguments = RecordUntilKilledArguments(arguments) else {
         FileHandle.standardError.write(Data(
-            "Usage: RecorderProbe record-until-killed --working PATH\n".utf8
+            "Usage: RecorderProbe record-until-killed --working PATH "
+                .appending("[--strategy fragmented|segmented]\n").utf8
         ))
         exit(64)
     }

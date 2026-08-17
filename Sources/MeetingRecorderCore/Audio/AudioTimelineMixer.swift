@@ -61,6 +61,9 @@ public struct AudioTimelineMixer: Sendable {
     private var microphoneLatestEnd: Int64?
     private var systemLastStart: Int64?
     private var microphoneLastStart: Int64?
+    private var systemLastEnd: Int64?
+    private var microphoneLastEnd: Int64?
+    private var hasEmittedOutput = false
 
     public init(sampleRate: Double, channels: Int, chunkFrames: Int) {
         precondition(sampleRate > 0)
@@ -90,17 +93,28 @@ public struct AudioTimelineMixer: Sendable {
         }
         setLastStart(chunk.startFrame, for: chunk.source)
 
-        if nextOutputFrame == nil {
-            nextOutputFrame = chunk.startFrame
+        if !hasEmittedOutput {
+            nextOutputFrame = min(nextOutputFrame ?? chunk.startFrame, chunk.startFrame)
         }
         guard let outputFrame = nextOutputFrame else { return [] }
-        guard chunk.startFrame >= outputFrame else {
-            recordWarning("Discarded an audio chunk that arrived after its timeline had advanced.")
+        let chunkEnd = chunk.startFrame + Int64(chunk.frameCount)
+        var acceptedStart = chunk.startFrame
+        if let sourceEnd = lastEnd(for: chunk.source) {
+            acceptedStart = max(acceptedStart, sourceEnd)
+        }
+        if hasEmittedOutput {
+            acceptedStart = max(acceptedStart, outputFrame)
+        }
+        if acceptedStart > chunk.startFrame {
+            recordWarning("Trimmed overlapping or late audio frames that were already on the timeline.")
+        }
+        setLastEnd(max(lastEnd(for: chunk.source) ?? chunkEnd, chunkEnd), for: chunk.source)
+        guard acceptedStart < chunkEnd else {
             return []
         }
 
         var output: [MixedAudioChunk] = []
-        var sourceOffset = 0
+        var sourceOffset = Int(acceptedStart - chunk.startFrame)
         while sourceOffset < chunk.frameCount {
             let frame = chunk.startFrame + Int64(sourceOffset)
             advanceSource(chunk.source, through: frame)
@@ -159,6 +173,7 @@ public struct AudioTimelineMixer: Sendable {
     }
 
     private mutating func makeOutput(startFrame: Int64, frameCount: Int) -> MixedAudioChunk {
+        hasEmittedOutput = true
         let hasBothSources = systemLatestEnd != nil && microphoneLatestEnd != nil
         let gain: Float = hasBothSources ? 0.5 : 1
         var samples = Array(repeating: Float.zero, count: frameCount * channels)
@@ -228,6 +243,20 @@ public struct AudioTimelineMixer: Sendable {
         switch source {
         case .system: systemLastStart = frame
         case .microphone: microphoneLastStart = frame
+        }
+    }
+
+    private func lastEnd(for source: CapturedAudioSource) -> Int64? {
+        switch source {
+        case .system: systemLastEnd
+        case .microphone: microphoneLastEnd
+        }
+    }
+
+    private mutating func setLastEnd(_ frame: Int64, for source: CapturedAudioSource) {
+        switch source {
+        case .system: systemLastEnd = frame
+        case .microphone: microphoneLastEnd = frame
         }
     }
 

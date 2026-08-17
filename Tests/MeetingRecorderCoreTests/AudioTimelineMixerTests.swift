@@ -107,4 +107,73 @@ final class AudioTimelineMixerTests: XCTestCase {
             48
         )
     }
+
+    func testEarlierSecondSourceCanMoveCursorBeforeFirstOutput() {
+        var mixer = AudioTimelineMixer(sampleRate: 48_000, channels: 2, chunkFrames: 4)
+        _ = mixer.ingest(.fixture(source: .system, startFrame: 100, monoValues: [1, 0, 0, 0]))
+
+        let output = mixer.ingest(
+            .fixture(source: .microphone, startFrame: 99, monoValues: [1, 0, 0, 0])
+        )
+
+        XCTAssertEqual(output.map(\.startFrame), [99])
+        XCTAssertFloatArraysEqual(output.flatMap(\.leftChannel), [0.5, 0.5, 0, 0])
+    }
+
+    func testTrimsOverlappingFramesFromSameSourceAndWarns() {
+        var mixer = AudioTimelineMixer(sampleRate: 48_000, channels: 2, chunkFrames: 4)
+        _ = mixer.ingest(
+            .fixture(source: .system, startFrame: 0, monoValues: Array(repeating: 0.1, count: 8))
+        )
+
+        _ = mixer.ingest(
+            .fixture(source: .system, startFrame: 4, monoValues: Array(repeating: 0.2, count: 8))
+        )
+        let output = mixer.flush()
+
+        XCTAssertFloatArraysEqual(
+            output.flatMap(\.leftChannel),
+            Array(repeating: 0.1, count: 8) + Array(repeating: 0.2, count: 4)
+        )
+        XCTAssertEqual(mixer.warnings.count, 1)
+    }
+
+    func testConverterKeepsMultipleResampledBuffersContiguousAndDrains() throws {
+        let converter = SampleBufferConverter()
+        let inputRate = 44_100.0
+        let origin = CMTime(seconds: 1, preferredTimescale: 44_100)
+        var chunks: [PCMChunk] = []
+        for index in 0..<12 {
+            let values = (0..<100).map { sample in
+                Int16(Double(Int16.max) * 0.2 * sin(
+                    2 * Double.pi * 440 * Double(index * 100 + sample) / inputRate
+                ))
+            }
+            let presentationTime = origin + CMTime(value: Int64(index * 100), timescale: 44_100)
+            let buffer = try AudioTestFactory.int16MonoSampleBuffer(
+                sampleRate: inputRate,
+                values: values,
+                presentationTime: presentationTime
+            )
+            chunks.append(try converter.convert(
+                CapturedAudioSample(
+                    source: .microphone,
+                    buffer: buffer,
+                    presentationTime: presentationTime
+                ),
+                sessionStartPTS: origin
+            ))
+        }
+        chunks.append(contentsOf: try converter.drain(source: .microphone))
+
+        XCTAssertFalse(chunks.isEmpty)
+        for pair in zip(chunks, chunks.dropFirst()) {
+            XCTAssertEqual(
+                pair.1.startFrame,
+                pair.0.startFrame + Int64(pair.0.frameCount)
+            )
+        }
+        XCTAssertGreaterThanOrEqual(chunks.reduce(0) { $0 + $1.frameCount }, 1_305)
+        XCTAssertLessThanOrEqual(chunks.reduce(0) { $0 + $1.frameCount }, 1_360)
+    }
 }

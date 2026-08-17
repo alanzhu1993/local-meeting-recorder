@@ -1,37 +1,69 @@
 import Darwin
 import Foundation
 
+struct SegmentedM4AWriterHooks: Sendable {
+    let beforeSegmentAppend: (@Sendable () async throws -> Void)?
+
+    init(beforeSegmentAppend: (@Sendable () async throws -> Void)? = nil) {
+        self.beforeSegmentAppend = beforeSegmentAppend
+    }
+}
+
+struct SegmentedRecordingSegment: Codable, Equatable, Sendable {
+    let index: Int64
+    let finalFileName: String
+}
+
+struct SegmentedRecordingCurrent: Codable, Equatable, Sendable {
+    let index: Int64
+    let workingFileName: String
+    let finalFileName: String
+}
+
+struct SegmentedRecordingManifest: Codable, Equatable, Sendable {
+    static let format = "meeting-recorder-segmented-m4a-v1"
+
+    let format: String
+    let sampleRate: Double
+    let channels: Int
+    let segmentFrames: Int64
+    var completed: [SegmentedRecordingSegment]
+    var current: SegmentedRecordingCurrent?
+}
+
 public actor SegmentedM4AWriter: RecoverableAudioWriting {
     private enum State {
         case idle
-        case running
-        case operating
-        case finished
-        case failed
+        case running(SegmentedSession)
+        case operating(SegmentedSession, UUID, URL?)
+        case aborting(SegmentedSession, UUID)
+        case finished(URL)
+        case failed(SegmentedSession?)
         case aborted
     }
 
-    private struct Segment: Sendable {
-        let index: Int64
-        let writer: FragmentedMOVWriter
-        let finalURL: URL
+    private struct InFlightOperation: Sendable {
+        let token: UUID
+        let cancel: @Sendable () -> Void
+        let wait: @Sendable () async -> Void
     }
 
     private let workingURL: URL
     private let sampleRate: Double
     private let channels: Int
     private let segmentFrames: Int64
+    private let hooks: SegmentedM4AWriterHooks
     private var state: State = .idle
-    private var currentSegment: Segment?
-    private var completedSegments: [URL] = []
-    private var lastEndFrame: Int64?
+    private var inFlight: InFlightOperation?
+    private var abortTask: Task<Void, Never>?
 
     public init(workingURL: URL) {
         self.init(
             workingURL: workingURL,
             sampleRate: 48_000,
             channels: 2,
-            segmentFrames: 480_000
+            segmentFrames: 480_000,
+            hooks: SegmentedM4AWriterHooks()
         )
     }
 
@@ -39,12 +71,14 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
         workingURL: URL,
         sampleRate: Double = 48_000,
         channels: Int = 2,
-        segmentFrames: Int64
+        segmentFrames: Int64,
+        hooks: SegmentedM4AWriterHooks = SegmentedM4AWriterHooks()
     ) {
         self.workingURL = workingURL
         self.sampleRate = sampleRate
         self.channels = channels
         self.segmentFrames = segmentFrames
+        self.hooks = hooks
     }
 
     public func start() async throws {
@@ -52,22 +86,31 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
             throw writeFailure("The segmented writer can only be started once.")
         }
         guard segmentFrames > 0, sampleRate > 0, channels == 2 else {
-            state = .failed
+            state = .failed(nil)
             throw writeFailure("The segmented writer configuration is invalid.")
         }
-        let descriptor = workingURL.path.withCString {
-            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        let manifest = SegmentedRecordingManifest(
+            format: SegmentedRecordingManifest.format,
+            sampleRate: sampleRate,
+            channels: channels,
+            segmentFrames: segmentFrames,
+            completed: [],
+            current: nil
+        )
+        do {
+            try SegmentedManifestIO.create(manifest, at: workingURL)
+            state = .running(SegmentedSession(manifest: manifest))
+        } catch let failure as RecordingFailure {
+            state = .failed(nil)
+            throw failure
+        } catch {
+            state = .failed(nil)
+            throw writeFailure("Could not create the segmented manifest: \(error.localizedDescription)")
         }
-        guard descriptor != -1 else {
-            state = .failed
-            throw writeFailure("The segmented working marker already exists or could not be created.")
-        }
-        _ = close(descriptor)
-        state = .running
     }
 
     public func append(_ chunk: MixedAudioChunk) async throws {
-        guard case .running = state else {
+        guard case let .running(session) = state else {
             throw writeFailure("Segmented audio cannot be appended in the current state.")
         }
         guard
@@ -75,87 +118,118 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
             chunk.frameCount > 0,
             chunk.samples.count == chunk.frameCount * channels
         else {
-            state = .failed
+            state = .failed(session)
             throw writeFailure("The mixed audio chunk has an invalid frame or sample count.")
         }
-        if let lastEndFrame, chunk.startFrame < lastEndFrame {
-            state = .failed
+        if let lastEndFrame = session.lastEndFrame,
+           chunk.startFrame < lastEndFrame {
+            state = .failed(session)
             throw writeFailure("The mixed audio timestamp moved backwards or overlapped prior audio.")
         }
 
-        state = .operating
+        let token = UUID()
+        let workingURL = self.workingURL
+        let sampleRate = self.sampleRate
+        let channels = self.channels
+        let segmentFrames = self.segmentFrames
+        let hooks = self.hooks
+        let operationTask = Task {
+            try await Self.performAppend(
+                chunk,
+                session: session,
+                workingURL: workingURL,
+                sampleRate: sampleRate,
+                channels: channels,
+                segmentFrames: segmentFrames,
+                hooks: hooks
+            )
+        }
+        state = .operating(session, token, nil)
+        inFlight = InFlightOperation(
+            token: token,
+            cancel: { operationTask.cancel() },
+            wait: { _ = await operationTask.result }
+        )
+
         do {
-            var sourceOffset = 0
-            while sourceOffset < chunk.frameCount {
-                let globalStart = chunk.startFrame + Int64(sourceOffset)
-                let segmentIndex = globalStart / segmentFrames
-                if currentSegment?.index != segmentIndex {
-                    try await closeCurrentSegment()
-                    currentSegment = try await startSegment(index: segmentIndex)
-                }
-                guard let currentSegment else {
-                    throw writeFailure("Could not create the current audio segment.")
-                }
-                let segmentEnd = (segmentIndex + 1) * segmentFrames
-                let frameCount = min(
-                    chunk.frameCount - sourceOffset,
-                    Int(segmentEnd - globalStart)
-                )
-                let sampleStart = sourceOffset * channels
-                let sampleEnd = sampleStart + frameCount * channels
-                let relativeChunk = MixedAudioChunk(
-                    startFrame: globalStart - segmentIndex * segmentFrames,
-                    frameCount: frameCount,
-                    samples: Array(chunk.samples[sampleStart..<sampleEnd])
-                )
-                try await currentSegment.writer.append(relativeChunk)
-                sourceOffset += frameCount
+            try await withTaskCancellationHandler {
+                try await operationTask.value
+            } onCancel: {
+                operationTask.cancel()
             }
-            lastEndFrame = chunk.startFrame + Int64(chunk.frameCount)
-            state = .running
+            guard ownsOperation(token) else {
+                throw writeFailure("Segmented append completed after another operation took ownership.")
+            }
+            inFlight = nil
+            state = .running(session)
         } catch let failure as RecordingFailure {
-            state = .failed
+            guard ownsOperation(token) else { throw failure }
+            inFlight = nil
+            state = .failed(session)
             throw failure
         } catch {
-            state = .failed
+            guard ownsOperation(token) else {
+                throw writeFailure("Segmented append was cancelled because the writer was aborted.")
+            }
+            inFlight = nil
+            state = .failed(session)
+            if error is CancellationError {
+                throw writeFailure("Segmented append was cancelled before completion.")
+            }
             throw writeFailure("Could not append segmented audio: \(error.localizedDescription)")
         }
     }
 
     public func finish(finalURL: URL) async throws -> URL {
-        guard case .running = state else {
+        guard case let .running(session) = state else {
             throw writeFailure("The segmented writer is not in a finishable state.")
         }
-        state = .operating
-        do {
-            try await closeCurrentSegment()
-            let output = try await M4AFinalizer().merge(
-                segmentURLs: completedSegments,
-                outputURL: finalURL
+        let token = UUID()
+        let workingURL = self.workingURL
+        let operationTask = Task {
+            try await Self.closeCurrentSegment(
+                session: session,
+                manifestURL: workingURL
             )
-            for segmentURL in completedSegments {
-                guard segmentURL.path.withCString({ unlink($0) }) == 0 else {
-                    state = .failed
-                    throw RecordingFailure(
-                        code: .finalize,
-                        message: "Merged audio was published, but a completed segment could not be removed."
-                    )
-                }
+            try Task.checkCancellation()
+            return try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: finalURL
+            )
+        }
+        state = .operating(session, token, finalURL)
+        inFlight = InFlightOperation(
+            token: token,
+            cancel: { operationTask.cancel() },
+            wait: { _ = await operationTask.result }
+        )
+
+        do {
+            let output = try await withTaskCancellationHandler {
+                try await operationTask.value
+            } onCancel: {
+                operationTask.cancel()
             }
-            guard workingURL.path.withCString({ unlink($0) }) == 0 else {
-                state = .failed
-                throw RecordingFailure(
-                    code: .finalize,
-                    message: "Merged audio was published, but the working marker could not be removed."
-                )
+            guard ownsOperation(token) else {
+                throw writeFailure("Segmented finish completed after another operation took ownership.")
             }
-            state = .finished
+            inFlight = nil
+            state = .finished(output)
             return output
         } catch let failure as RecordingFailure {
-            state = .failed
+            guard ownsOperation(token) else { throw failure }
+            inFlight = nil
+            state = .failed(session)
             throw failure
         } catch {
-            state = .failed
+            guard ownsOperation(token) else {
+                throw writeFailure("Segmented finish was cancelled because the writer was aborted.")
+            }
+            inFlight = nil
+            state = .failed(session)
+            if error is CancellationError {
+                throw writeFailure("Segmented finish was cancelled before publishing the recording.")
+            }
             throw RecordingFailure(
                 code: .finalize,
                 message: "Could not finalize segmented audio: \(error.localizedDescription)"
@@ -164,38 +238,298 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
     }
 
     public func abort() async {
-        let segment = currentSegment
-        state = .aborted
-        await segment?.writer.abort()
+        if let abortTask {
+            await abortTask.value
+            return
+        }
+
+        let session: SegmentedSession
+        let committedURL: URL?
+        switch state {
+        case .idle:
+            state = .aborted
+            return
+        case let .running(current):
+            session = current
+            committedURL = nil
+        case let .operating(current, _, finalURL):
+            session = current
+            committedURL = finalURL
+        case let .failed(current?):
+            session = current
+            committedURL = nil
+        case .failed(nil), .aborted:
+            state = .aborted
+            return
+        case .finished:
+            return
+        case .aborting:
+            return
+        }
+
+        let token = UUID()
+        let operation = inFlight
+        operation?.cancel()
+        let task = Task {
+            await operation?.wait()
+            await session.currentSegment?.writer.abort()
+        }
+        abortTask = task
+        state = .aborting(session, token)
+        await task.value
+
+        guard ownsAbort(token) else { return }
+        inFlight = nil
+        abortTask = nil
+        if let committedURL,
+           FileManager.default.fileExists(atPath: committedURL.path),
+           !FileManager.default.fileExists(atPath: workingURL.path) {
+            state = .finished(committedURL)
+        } else {
+            state = .aborted
+        }
     }
 
-    private func startSegment(index: Int64) async throws -> Segment {
+    private func ownsOperation(_ token: UUID) -> Bool {
+        guard case let .operating(_, current, _) = state else { return false }
+        return current == token && inFlight?.token == token
+    }
+
+    private func ownsAbort(_ token: UUID) -> Bool {
+        guard case let .aborting(_, current) = state else { return false }
+        return current == token
+    }
+
+    private static func performAppend(
+        _ chunk: MixedAudioChunk,
+        session: SegmentedSession,
+        workingURL: URL,
+        sampleRate: Double,
+        channels: Int,
+        segmentFrames: Int64,
+        hooks: SegmentedM4AWriterHooks
+    ) async throws {
+        var sourceOffset = 0
+        while sourceOffset < chunk.frameCount {
+            try Task.checkCancellation()
+            let globalStart = chunk.startFrame + Int64(sourceOffset)
+            let segmentIndex = globalStart / segmentFrames
+            if session.currentSegment?.index != segmentIndex {
+                try await closeCurrentSegment(
+                    session: session,
+                    manifestURL: workingURL
+                )
+                try Task.checkCancellation()
+                session.currentSegment = try await startSegment(
+                    index: segmentIndex,
+                    session: session,
+                    manifestURL: workingURL,
+                    sampleRate: sampleRate,
+                    channels: channels
+                )
+            }
+            guard let currentSegment = session.currentSegment else {
+                throw RecordingFailure(code: .write, message: "Could not create the current audio segment.")
+            }
+            let segmentEnd = (segmentIndex + 1) * segmentFrames
+            let frameCount = min(
+                chunk.frameCount - sourceOffset,
+                Int(segmentEnd - globalStart)
+            )
+            let sampleStart = sourceOffset * channels
+            let sampleEnd = sampleStart + frameCount * channels
+            let relativeChunk = MixedAudioChunk(
+                startFrame: globalStart - segmentIndex * segmentFrames,
+                frameCount: frameCount,
+                samples: Array(chunk.samples[sampleStart..<sampleEnd])
+            )
+            try await hooks.beforeSegmentAppend?()
+            try Task.checkCancellation()
+            try await currentSegment.writer.append(relativeChunk)
+            try Task.checkCancellation()
+            sourceOffset += frameCount
+        }
+        session.lastEndFrame = chunk.startFrame + Int64(chunk.frameCount)
+    }
+
+    private static func startSegment(
+        index: Int64,
+        session: SegmentedSession,
+        manifestURL: URL,
+        sampleRate: Double,
+        channels: Int
+    ) async throws -> SegmentedSession.Segment {
         let prefix = String(format: "%06lld", index)
-        let directory = workingURL.deletingLastPathComponent()
-        let base = workingURL.lastPathComponent
-        let segmentWorkingURL = directory.appendingPathComponent(
-            ".\(base).segment-\(prefix).inprogress.mov"
+        let base = manifestURL.lastPathComponent
+        let workingFileName = ".\(base).segment-\(prefix).inprogress.mov"
+        let finalFileName = ".\(base).segment-\(prefix).m4a"
+        let directory = manifestURL.deletingLastPathComponent()
+        let current = SegmentedRecordingCurrent(
+            index: index,
+            workingFileName: workingFileName,
+            finalFileName: finalFileName
         )
-        let segmentFinalURL = directory.appendingPathComponent(
-            ".\(base).segment-\(prefix).m4a"
-        )
+        session.manifest.current = current
+        try SegmentedManifestIO.replace(session.manifest, at: manifestURL)
+        try Task.checkCancellation()
+
         let writer = FragmentedMOVWriter(
-            workingURL: segmentWorkingURL,
+            workingURL: directory.appendingPathComponent(workingFileName),
             sampleRate: sampleRate,
             channels: channels
         )
-        try await writer.start()
-        return Segment(index: index, writer: writer, finalURL: segmentFinalURL)
+        do {
+            try await writer.start()
+            try Task.checkCancellation()
+            return SegmentedSession.Segment(
+                index: index,
+                writer: writer,
+                finalURL: directory.appendingPathComponent(finalFileName)
+            )
+        } catch {
+            await writer.abort()
+            throw error
+        }
     }
 
-    private func closeCurrentSegment() async throws {
-        guard let segment = currentSegment else { return }
-        currentSegment = nil
+    private static func closeCurrentSegment(
+        session: SegmentedSession,
+        manifestURL: URL
+    ) async throws {
+        guard let segment = session.currentSegment else { return }
         let output = try await segment.writer.finish(finalURL: segment.finalURL)
-        completedSegments.append(output)
+        try Task.checkCancellation()
+        let entry = SegmentedRecordingSegment(
+            index: segment.index,
+            finalFileName: output.lastPathComponent
+        )
+        if !session.manifest.completed.contains(where: { $0.index == entry.index }) {
+            session.manifest.completed.append(entry)
+            session.manifest.completed.sort { $0.index < $1.index }
+        }
+        session.manifest.current = nil
+        try SegmentedManifestIO.replace(session.manifest, at: manifestURL)
+        session.currentSegment = nil
     }
 
     private func writeFailure(_ message: String) -> RecordingFailure {
         RecordingFailure(code: .write, message: message)
+    }
+}
+
+private final class SegmentedSession: @unchecked Sendable {
+    struct Segment: Sendable {
+        let index: Int64
+        let writer: FragmentedMOVWriter
+        let finalURL: URL
+    }
+
+    var manifest: SegmentedRecordingManifest
+    var currentSegment: Segment?
+    var lastEndFrame: Int64?
+
+    init(manifest: SegmentedRecordingManifest) {
+        self.manifest = manifest
+    }
+}
+
+enum SegmentedManifestIO {
+    static func load(from url: URL) throws -> SegmentedRecordingManifest? {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: .mappedIfSafe)
+        } catch {
+            return nil
+        }
+        guard let manifest = try? JSONDecoder().decode(
+            SegmentedRecordingManifest.self,
+            from: data
+        ), manifest.format == SegmentedRecordingManifest.format else {
+            return nil
+        }
+        return manifest
+    }
+
+    static func create(
+        _ manifest: SegmentedRecordingManifest,
+        at url: URL
+    ) throws {
+        let temporary = try writeTemporary(manifest, near: url)
+        defer { _ = temporary.path.withCString { unlink($0) } }
+        let result = temporary.path.withCString { temporaryPath in
+            url.path.withCString { destinationPath in
+                link(temporaryPath, destinationPath)
+            }
+        }
+        guard result == 0 else {
+            let reason = String(cString: strerror(errno))
+            throw RecordingFailure(
+                code: .write,
+                message: "Could not create the segmented manifest without overwriting: \(reason)"
+            )
+        }
+    }
+
+    static func replace(
+        _ manifest: SegmentedRecordingManifest,
+        at url: URL
+    ) throws {
+        let temporary = try writeTemporary(manifest, near: url)
+        let result = temporary.path.withCString { temporaryPath in
+            url.path.withCString { destinationPath in
+                rename(temporaryPath, destinationPath)
+            }
+        }
+        guard result == 0 else {
+            let reason = String(cString: strerror(errno))
+            _ = temporary.path.withCString { unlink($0) }
+            throw RecordingFailure(
+                code: .write,
+                message: "Could not atomically update the segmented manifest: \(reason)"
+            )
+        }
+    }
+
+    private static func writeTemporary(
+        _ manifest: SegmentedRecordingManifest,
+        near url: URL
+    ) throws -> URL {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(manifest)
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(
+            ".\(url.lastPathComponent).\(UUID().uuidString).manifest.tmp"
+        )
+        let descriptor = temporary.path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        }
+        guard descriptor != -1 else {
+            let reason = String(cString: strerror(errno))
+            throw RecordingFailure(code: .write, message: "Could not create manifest staging: \(reason)")
+        }
+        var succeeded = false
+        defer {
+            _ = close(descriptor)
+            if !succeeded {
+                _ = temporary.path.withCString { unlink($0) }
+            }
+        }
+        let writeSucceeded = data.withUnsafeBytes { bytes -> Bool in
+            guard var pointer = bytes.baseAddress else { return data.isEmpty }
+            var remaining = bytes.count
+            while remaining > 0 {
+                let written = Darwin.write(descriptor, pointer, remaining)
+                guard written > 0 else { return false }
+                remaining -= written
+                pointer = pointer.advanced(by: written)
+            }
+            return true
+        }
+        guard writeSucceeded, fsync(descriptor) == 0 else {
+            let reason = String(cString: strerror(errno))
+            throw RecordingFailure(code: .write, message: "Could not persist manifest staging: \(reason)")
+        }
+        succeeded = true
+        return temporary
     }
 }

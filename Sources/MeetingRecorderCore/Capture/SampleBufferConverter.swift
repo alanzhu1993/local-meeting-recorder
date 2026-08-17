@@ -37,7 +37,20 @@ public final class SampleBufferConverter: @unchecked Sendable {
         }
 
         let input = try makeInputBuffer(from: sample.buffer)
-        let state = try converterState(for: sample.source, inputFormat: input.format)
+        let presentationFrame = AudioTimeline.framePosition(
+            for: sample.presentationTime,
+            origin: sessionStartPTS,
+            sampleRate: Self.outputSampleRate
+        )
+        var state = try converterState(for: sample.source, inputFormat: input.format)
+        if let outputCursor = state.outputCursor,
+           abs(presentationFrame - outputCursor) > state.discontinuityToleranceFrames {
+            state = try replaceConverterState(
+                for: sample.source,
+                inputFormat: input.format
+            )
+        }
+        let startFrame = state.outputCursor ?? presentationFrame
         let ratio = Self.outputSampleRate / input.format.sampleRate
         let expectedFrames = Int(ceil(Double(input.frameLength) * ratio))
         let primeFrames = Int(state.converter.primeInfo.leadingFrames)
@@ -60,16 +73,60 @@ public final class SampleBufferConverter: @unchecked Sendable {
         }
 
         let samples = try interleavedFloatSamples(from: output)
+        state.outputCursor = startFrame + Int64(output.frameLength)
         return PCMChunk(
             source: sample.source,
-            startFrame: AudioTimeline.framePosition(
-                for: sample.presentationTime,
-                origin: sessionStartPTS,
-                sampleRate: Self.outputSampleRate
-            ),
+            startFrame: startFrame,
             frameCount: Int(output.frameLength),
             samples: samples
         )
+    }
+
+    public func drain(source: CapturedAudioSource) throws -> [PCMChunk] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = storedConverterState(for: source),
+              var outputCursor = state.outputCursor else {
+            return []
+        }
+
+        var chunks: [PCMChunk] = []
+        let inputProvider = ConverterEndOfStreamProvider()
+        for _ in 0..<8 {
+            guard let output = AVAudioPCMBuffer(
+                pcmFormat: outputFormat,
+                frameCapacity: 4_096
+            ) else {
+                throw RecordingFailure(code: .capture, message: "Could not allocate converter drain storage.")
+            }
+            var conversionError: NSError?
+            let status = state.converter.convert(
+                to: output,
+                error: &conversionError
+            ) { _, inputStatus in
+                inputProvider.next(status: inputStatus)
+            }
+            if let conversionError {
+                throw RecordingFailure(
+                    code: .capture,
+                    message: "Could not drain captured audio: \(conversionError.localizedDescription)"
+                )
+            }
+            if output.frameLength > 0 {
+                chunks.append(PCMChunk(
+                    source: source,
+                    startFrame: outputCursor,
+                    frameCount: Int(output.frameLength),
+                    samples: try interleavedFloatSamples(from: output)
+                ))
+                outputCursor += Int64(output.frameLength)
+            }
+            if status == .endOfStream || (status == .inputRanDry && output.frameLength == 0) {
+                break
+            }
+        }
+        clearConverterState(for: source)
+        return chunks
     }
 
     private func converterState(
@@ -77,14 +134,18 @@ public final class SampleBufferConverter: @unchecked Sendable {
         inputFormat: AVAudioFormat
     ) throws -> ConverterState {
         let signature = InputFormatSignature(inputFormat.streamDescription.pointee)
-        let existing: ConverterState?
-        switch source {
-        case .system: existing = systemConverter
-        case .microphone: existing = microphoneConverter
-        }
+        let existing = storedConverterState(for: source)
         if let existing, existing.signature == signature {
             return existing
         }
+        return try replaceConverterState(for: source, inputFormat: inputFormat)
+    }
+
+    private func replaceConverterState(
+        for source: CapturedAudioSource,
+        inputFormat: AVAudioFormat
+    ) throws -> ConverterState {
+        let signature = InputFormatSignature(inputFormat.streamDescription.pointee)
         guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
             throw RecordingFailure(code: .capture, message: "The captured audio format cannot be converted to 48 kHz stereo PCM.")
         }
@@ -95,6 +156,20 @@ public final class SampleBufferConverter: @unchecked Sendable {
         case .microphone: microphoneConverter = state
         }
         return state
+    }
+
+    private func storedConverterState(for source: CapturedAudioSource) -> ConverterState? {
+        switch source {
+        case .system: systemConverter
+        case .microphone: microphoneConverter
+        }
+    }
+
+    private func clearConverterState(for source: CapturedAudioSource) {
+        switch source {
+        case .system: systemConverter = nil
+        case .microphone: microphoneConverter = nil
+        }
     }
 
     private func makeInputBuffer(from sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer {
@@ -225,10 +300,16 @@ private struct InputFormatSignature: Equatable {
 private final class ConverterState {
     let signature: InputFormatSignature
     let converter: AVAudioConverter
+    let discontinuityToleranceFrames: Int64
+    var outputCursor: Int64?
 
     init(signature: InputFormatSignature, converter: AVAudioConverter) {
         self.signature = signature
         self.converter = converter
+        discontinuityToleranceFrames = max(
+            2,
+            Int64(ceil(SampleBufferConverter.outputSampleRate / signature.sampleRate * 2))
+        )
     }
 }
 
@@ -253,5 +334,14 @@ private final class ConverterInputProvider: @unchecked Sendable {
         supplied = true
         status.pointee = .haveData
         return buffer
+    }
+}
+
+private final class ConverterEndOfStreamProvider: @unchecked Sendable {
+    func next(
+        status: UnsafeMutablePointer<AVAudioConverterInputStatus>
+    ) -> AVAudioBuffer? {
+        status.pointee = .endOfStream
+        return nil
     }
 }
