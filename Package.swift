@@ -17,7 +17,13 @@ let package = Package(
             name: "MeetingRecorderCoreTests",
             dependencies: ["MeetingRecorderCore"],
             path: "Tests",
+            exclude: ["MeetingRecorderAppTests"],
             sources: ["MeetingRecorderCoreTests", "TestSupport"]
+        ),
+        .testTarget(
+            name: "MeetingRecorderAppTests",
+            dependencies: ["MeetingRecorderApp", "MeetingRecorderCore"],
+            path: "Tests/MeetingRecorderAppTests"
         ),
     ]
 )
