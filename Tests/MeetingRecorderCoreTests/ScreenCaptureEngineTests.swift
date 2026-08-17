@@ -53,39 +53,74 @@ final class ScreenCaptureEngineTests: XCTestCase {
         XCTAssertEqual(unexpectedSecond.startCallCount, 0)
     }
 
-    func testStopWhileStartingCancelsThatSessionAndAllowsRestart() async throws {
-        let first = TestBackendControl(suspendsStart: true)
+    func testCancelledStartWithConcurrentStopWaitsForCleanupBeforeRestarting() async throws {
+        let first = TestBackendControl(suspendsStart: true, suspendsStop: true)
         let second = TestBackendControl()
         let factory = TestBackendFactory([first, second])
         let engine = ScreenCaptureEngine(backendFactory: factory.make)
         let firstSessionEvents = TestEventRecorder()
+        let cleanupReleased = TestLockedFlag()
+        let startReturnedBeforeCleanup = expectation(
+            description: "cancelled start returned before cleanup"
+        )
+        startReturnedBeforeCleanup.isInverted = true
+        let stopReturnedBeforeCleanup = expectation(
+            description: "concurrent stop returned before cleanup"
+        )
+        stopReturnedBeforeCleanup.isInverted = true
 
-        let firstStart = Task {
-            try await engine.start { event in
-                await firstSessionEvents.record(event)
+        let firstStart = Task { () -> Result<Void, any Error> in
+            let result: Result<Void, any Error>
+            do {
+                try await engine.start { event in
+                    await firstSessionEvents.record(event)
+                }
+                result = .success(())
+            } catch {
+                result = .failure(error)
             }
+            if !cleanupReleased.value {
+                startReturnedBeforeCleanup.fulfill()
+            }
+            return result
         }
         await first.waitUntilStartEntered()
 
         let stop = Task {
             await engine.stop()
+            if !cleanupReleased.value {
+                stopReturnedBeforeCleanup.fulfill()
+            }
         }
         await first.waitUntilStartWasCancelled()
+        firstStart.cancel()
         first.openStartGate()
-        await stop.value
+        await first.waitUntilStopEntered()
+        await fulfillment(
+            of: [startReturnedBeforeCleanup, stopReturnedBeforeCleanup],
+            timeout: 0.1
+        )
 
-        do {
-            try await firstStart.value
+        cleanupReleased.setTrue()
+        first.openStopGate()
+        let startResult = await firstStart.value
+        await stop.value
+        if case .success = startResult {
             XCTFail("A stopped in-flight start must not become running.")
-        } catch {}
+        }
+        if case let .failure(error) = startResult {
+            XCTAssertTrue(error is CancellationError)
+        }
         await firstSessionEvents.waitForStoppedEvent()
 
         try await engine.start { _ in }
         await engine.stop()
 
         let stoppedEventCount = await firstSessionEvents.stoppedEventCount
+        XCTAssertEqual(first.startCancellationCount, 1)
         XCTAssertEqual(first.stopCallCount, 1)
         XCTAssertEqual(second.startCallCount, 1)
+        XCTAssertEqual(second.stopCallCount, 1)
         XCTAssertEqual(stoppedEventCount, 1)
     }
 
