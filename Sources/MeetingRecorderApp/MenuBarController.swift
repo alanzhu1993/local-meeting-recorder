@@ -6,7 +6,7 @@ import SwiftUI
 final class MenuBarController: NSObject, NSPopoverDelegate {
     private let statusItem: NSStatusItem
     private let popover: NSPopover
-    private var presentationSubscription: AnyCancellable?
+    private var subscriptions = Set<AnyCancellable>()
     private var settingsWindowController: SettingsWindowController?
 
     init(
@@ -22,7 +22,7 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     func show(rootView: MenuBarView) {
         popover.behavior = .transient
         popover.animates = false
-        popover.contentSize = NSSize(width: 292, height: 470)
+        popover.contentSize = NSSize(width: 292, height: rootView.model.preferredHeight)
         let hostingController = NSHostingController(rootView: rootView)
         hostingController.sizingOptions = [.preferredContentSize]
         popover.contentViewController = hostingController
@@ -38,8 +38,15 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
     }
 
     func bind(to model: MenuBarViewModel) {
-        presentationSubscription = model.$presentation
+        subscriptions.removeAll()
+        model.$presentation
             .sink { [weak self] presentation in self?.update(presentation) }
+            .store(in: &subscriptions)
+        model.$preferredHeight
+            .sink { [weak self] height in
+                self?.popover.contentSize = NSSize(width: 292, height: height)
+            }
+            .store(in: &subscriptions)
     }
 
     func update(_ presentation: MenuBarPresentation) {

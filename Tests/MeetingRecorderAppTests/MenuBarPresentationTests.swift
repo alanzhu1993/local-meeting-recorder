@@ -179,11 +179,106 @@ final class MenuBarPresentationTests: XCTestCase {
         ))
 
         XCTAssertEqual(popover.behavior, .transient)
-        XCTAssertEqual(popover.contentSize, NSSize(width: 292, height: 470))
+        XCTAssertEqual(popover.contentSize.width, 292)
         XCTAssertTrue(statusItem.button?.target === controller)
         XCTAssertEqual(statusItem.button?.action, #selector(MenuBarController.togglePopover))
         XCTAssertEqual(statusItem.button?.accessibilityLabel(), "会议录音，无法开始录音：需要授权")
         XCTAssertFalse(statusItem.button?.accessibilityLabel()?.contains("正在录音") == true)
+
+        controller.bind(to: model)
+        XCTAssertEqual(popover.contentSize.height, 370)
+        model.permissionMessage = "请开启录音权限。"
+        XCTAssertEqual(popover.contentSize.height, 470)
+        model.permissionMessage = nil
+        XCTAssertEqual(popover.contentSize.height, 370)
+    }
+
+    func testPermissionRequestGrantedOnRecheckStartsExactlyOnce() async {
+        let missing = CapturePermissionStatus(missing: [.systemAudio, .microphone])
+        let granted = CapturePermissionStatus(missing: [])
+        let permissions = PermissionCheckingSpy(
+            currentResponses: [missing, granted],
+            requestResponse: granted
+        )
+        var toggleCount = 0
+        var messages: [String?] = []
+        let action = PermissionGatedRecordingAction(
+            permissions: permissions,
+            phase: { .idle },
+            toggle: { toggleCount += 1 },
+            updatePermissionMessage: { messages.append($0) }
+        )
+
+        await action.perform()
+
+        XCTAssertEqual(permissions.requestCount, 1)
+        XCTAssertEqual(permissions.currentCount, 2)
+        XCTAssertEqual(toggleCount, 1)
+        XCTAssertNil(messages.last ?? "unexpected")
+    }
+
+    func testPermissionRequestDeniedShowsMessageWithoutAutomaticRetry() async {
+        let missing = CapturePermissionStatus(missing: [.systemAudio])
+        let permissions = PermissionCheckingSpy(
+            currentResponses: [missing, missing],
+            requestResponse: missing
+        )
+        var toggleCount = 0
+        var message: String?
+        let action = PermissionGatedRecordingAction(
+            permissions: permissions,
+            phase: { .failed(.init(code: .permission, message: "需要授权")) },
+            toggle: { toggleCount += 1 },
+            updatePermissionMessage: { message = $0 }
+        )
+
+        await action.perform()
+
+        XCTAssertEqual(permissions.requestCount, 1)
+        XCTAssertEqual(permissions.currentCount, 2)
+        XCTAssertEqual(toggleCount, 0)
+        XCTAssertEqual(message, missing.userMessage)
+    }
+
+    func testStoppingRecordingNeverRequestsPermissionAgain() async {
+        let missing = CapturePermissionStatus(missing: [.microphone])
+        let permissions = PermissionCheckingSpy(
+            currentResponses: [missing],
+            requestResponse: missing
+        )
+        var toggleCount = 0
+        let recording = RecordingPhase.recording(active, warning: nil)
+        let action = PermissionGatedRecordingAction(
+            permissions: permissions,
+            phase: { recording },
+            toggle: { toggleCount += 1 },
+            updatePermissionMessage: { _ in }
+        )
+
+        await action.perform()
+
+        XCTAssertEqual(permissions.currentCount, 0)
+        XCTAssertEqual(permissions.requestCount, 0)
+        XCTAssertEqual(toggleCount, 1)
+    }
+
+    func testOpenTodayKeepsUsingLaunchRootAfterExpectedSettingChanges() {
+        let launchRoot = URL(fileURLWithPath: "/tmp/launch-root", isDirectory: true)
+        let changedRoot = URL(fileURLWithPath: "/tmp/changed-root", isDirectory: true)
+        var settings = AppSettings.default
+        settings.recordingRoot = changedRoot
+        let resolver = LaunchRecordingLocation(root: launchRoot, timeZone: TimeZone(secondsFromGMT: 0)!)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let date = try! XCTUnwrap(calendar.date(from: DateComponents(year: 2024, month: 8, day: 22)))
+
+        let target = resolver.target(for: date) { path in
+            path.hasPrefix(launchRoot.path) && path.hasSuffix("2024-08-22")
+        }
+
+        XCTAssertEqual(settings.recordingRoot, changedRoot)
+        XCTAssertEqual(target.path, "/tmp/launch-root/2024-08-22")
+        XCTAssertFalse(target.path.hasPrefix(changedRoot.path))
     }
 
     func testFailedHotkeyRegistrationRestoresOldSettingAndRegistration() {
@@ -206,6 +301,27 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertEqual(persistence.savedSettings.last?.hotkey, old)
     }
 
+    func testHotkeyTeardownFailureStopsBeforeRegisteringReplacement() {
+        let old = AppMetadata.defaultHotkey
+        let replacement = HotkeyDescriptor(keyCode: 1, modifiers: 0x0100, displayText: "⌘S")
+        let persistence = SettingsPersistenceSpy(settings: .default)
+        let hotkey = HotkeyRegistrationSpy()
+        let model = SettingsViewModel(
+            initialSettings: .default,
+            persistence: persistence,
+            hotkey: hotkey,
+            hotkeyTeardownError: { TestError.rejected },
+            loginItem: LoginItemSpy()
+        )
+
+        model.applyHotkey(replacement)
+
+        XCTAssertEqual(hotkey.unregisterCount, 1)
+        XCTAssertTrue(hotkey.registrations.isEmpty)
+        XCTAssertEqual(model.settings.hotkey, old)
+        XCTAssertTrue(model.errorMessage?.contains("重启") == true)
+    }
+
     func testFailedLoginItemChangeRestoresOldValue() {
         let persistence = SettingsPersistenceSpy(settings: .default)
         let login = LoginItemSpy(error: TestError.rejected)
@@ -223,6 +339,42 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertEqual(persistence.savedSettings.last?.launchAtLogin, true)
     }
 
+    func testShowingSettingsRefreshesExternalLoginItemStateWithoutOverwritingExpectation() {
+        let persistence = SettingsPersistenceSpy(settings: .default)
+        let login = LoginItemSpy()
+        let model = SettingsViewModel(
+            initialSettings: .default,
+            persistence: persistence,
+            hotkey: HotkeyRegistrationSpy(),
+            loginItem: login
+        )
+        login.isEnabled = false
+
+        let controller = SettingsWindowController()
+        controller.show(model: model)
+
+        XCTAssertFalse(model.launchAtLoginIsEnabled)
+        XCTAssertTrue(model.settings.launchAtLogin)
+        XCTAssertTrue(persistence.savedSettings.isEmpty)
+        controller.window?.close()
+    }
+
+    func testStoppingNeverShowsStaleAudioMeters() {
+        let stopping = MenuBarViewModel.preview(
+            phase: .stopping(active),
+            elapsed: 20,
+            audioLevels: AudioLevels(system: 0.9, microphone: 0.8)
+        )
+        let recording = MenuBarViewModel.preview(
+            phase: .recording(active, warning: nil),
+            elapsed: 20,
+            audioLevels: AudioLevels(system: 0.9, microphone: 0.8)
+        )
+
+        XCTAssertFalse(stopping.showsAudioMeter)
+        XCTAssertTrue(recording.showsAudioMeter)
+    }
+
     func testSettingsWindowReusesOneWindow() {
         let controller = SettingsWindowController()
         let model = SettingsViewModel.preview
@@ -232,6 +384,7 @@ final class MenuBarPresentationTests: XCTestCase {
         controller.show(model: model)
 
         XCTAssertTrue(firstWindow === controller.window)
+        XCTAssertGreaterThanOrEqual(controller.window?.contentView?.bounds.height ?? 0, 560)
         controller.window?.close()
     }
 
@@ -250,58 +403,49 @@ final class MenuBarPresentationTests: XCTestCase {
             message: "未检测到麦克风，系统声音仍在录制。请检查麦克风连接。"
         )
 
-        try capture(
-            AnyView(MenuBarView(model: .preview())),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-待机-2026-08-17.png")
+        try captureMenu(
+            model: .preview(),
+            at: directory.appendingPathComponent("菜单栏-待机-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(MenuBarView(model: .preview(
+        try captureMenu(
+            model: .preview(
                 phase: .recording(active, warning: nil),
                 elapsed: 90_061,
                 audioLevels: AudioLevels(system: 0.72, microphone: 0.48)
-            ))),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-录音-2026-08-17.png")
+            ),
+            at: directory.appendingPathComponent("菜单栏-录音-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(MenuBarView(model: .preview(
+        try captureMenu(
+            model: .preview(
                 phase: .recording(active, warning: warning),
                 elapsed: 72,
                 audioLevels: AudioLevels(system: 0.64, microphone: 0)
-            ))),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-麦克风提醒-2026-08-17.png")
+            ),
+            at: directory.appendingPathComponent("菜单栏-麦克风提醒-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(MenuBarView(model: .preview(
+        try captureMenu(
+            model: .preview(
                 phase: .stopping(active),
-                elapsed: 86
-            ))),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-保存-2026-08-17.png")
+                elapsed: 86,
+                audioLevels: AudioLevels(system: 0.91, microphone: 0.84)
+            ),
+            at: directory.appendingPathComponent("菜单栏-保存-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(MenuBarView(model: .preview(
+        try captureMenu(
+            model: .preview(
                 phase: .failed(longFailure),
                 permissionMessage: longFailure.message
-            ))),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-权限失败-2026-08-17.png")
+            ),
+            at: directory.appendingPathComponent("菜单栏-权限失败-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(MenuBarView(model: .preview(
+        try captureMenu(
+            model: .preview(
                 isRecovering: true,
                 recoveryMessage: "正在恢复：会议录音-2026-08-16-23-58-09-未完整恢复.m4a"
-            ))),
-            size: NSSize(width: 292, height: 470),
-            at: directory.appendingPathComponent("菜单栏-恢复-2026-08-17.png")
+            ),
+            at: directory.appendingPathComponent("菜单栏-恢复-Round1-2026-08-18.png")
         )
-        try capture(
-            AnyView(SettingsView(model: .preview)),
-            size: NSSize(width: 480, height: 480),
-            at: directory.appendingPathComponent("设置-2026-08-17.png")
-        )
+
         let narrowSettings = AppSettings(
             recordingRoot: URL(fileURLWithPath: "/Users/alan/Documents/一个很长的中文保存目录/会议录音文件/需要在窄窗口中完整换行", isDirectory: true),
             hotkey: AppMetadata.defaultHotkey,
@@ -314,10 +458,52 @@ final class MenuBarPresentationTests: XCTestCase {
             hotkey: HotkeyRegistrationSpy(),
             loginItem: LoginItemSpy()
         )
+        let settingsController = SettingsWindowController()
+        settingsController.show(model: narrowModel)
+        let settingsWindow = try XCTUnwrap(settingsController.window)
+        settingsWindow.orderFrontRegardless()
+        XCTAssertTrue(settingsWindow.isVisible)
+        XCTAssertTrue(settingsWindow.canBecomeKey)
+        XCTAssertTrue(settingsWindow.makeFirstResponder(nil))
+        try captureWindow(
+            settingsWindow,
+            at: directory.appendingPathComponent("设置窗口-正常-Round1-2026-08-18.png")
+        )
+
+        narrowModel.errorMessage = "无法安全移除旧快捷键。请重启应用后再修改；本次没有注册新快捷键，也没有修改已保存的设置。"
+        XCTAssertTrue(settingsWindow.makeFirstResponder(nil))
+        try captureWindow(
+            settingsWindow,
+            at: directory.appendingPathComponent("设置窗口-错误-Round1-2026-08-18.png")
+        )
+
+        settingsWindow.setContentSize(settingsWindow.contentMinSize)
+        XCTAssertTrue(settingsWindow.makeFirstResponder(nil))
+        try captureWindow(
+            settingsWindow,
+            at: directory.appendingPathComponent("设置窗口-最小尺寸-Round1-2026-08-18.png")
+        )
+
+        narrowModel.errorMessage = nil
+        settingsWindow.makeKeyAndOrderFront(nil)
+        let contentView = try XCTUnwrap(settingsWindow.contentView)
+        contentView.layoutSubtreeIfNeeded()
+        let recorder = try XCTUnwrap(firstSubview(of: ShortcutRecorderNSView.self, in: contentView))
+        XCTAssertTrue(settingsWindow.makeFirstResponder(recorder))
+        recorder.needsDisplay = true
+        try captureWindow(
+            settingsWindow,
+            at: directory.appendingPathComponent("设置窗口-快捷键焦点-Round1-2026-08-18.png")
+        )
+        settingsWindow.makeFirstResponder(nil)
+        settingsWindow.close()
+    }
+
+    private func captureMenu(model: MenuBarViewModel, at outputURL: URL) throws {
         try capture(
-            AnyView(SettingsView(model: narrowModel)),
-            size: NSSize(width: 420, height: 520),
-            at: directory.appendingPathComponent("设置-窄窗口-2026-08-17.png")
+            AnyView(MenuBarView(model: model)),
+            size: NSSize(width: 292, height: model.preferredHeight),
+            at: outputURL
         )
     }
 
@@ -343,6 +529,27 @@ final class MenuBarPresentationTests: XCTestCase {
         }
         try data.write(to: outputURL, options: .atomic)
         window.close()
+    }
+
+    private func captureWindow(_ window: NSWindow, at outputURL: URL) throws {
+        let contentView = try XCTUnwrap(window.contentView)
+        contentView.layoutSubtreeIfNeeded()
+        guard let bitmap = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) else {
+            return XCTFail("Unable to allocate window bitmap for \(outputURL.lastPathComponent)")
+        }
+        contentView.cacheDisplay(in: contentView.bounds, to: bitmap)
+        guard let data = bitmap.representation(using: .png, properties: [:]) else {
+            return XCTFail("Unable to encode window PNG for \(outputURL.lastPathComponent)")
+        }
+        try data.write(to: outputURL, options: .atomic)
+    }
+
+    private func firstSubview<View: NSView>(of type: View.Type, in root: NSView) -> View? {
+        if let match = root as? View { return match }
+        for subview in root.subviews {
+            if let match = firstSubview(of: type, in: subview) { return match }
+        }
+        return nil
     }
 }
 
@@ -378,6 +585,7 @@ private final class SettingsPersistenceSpy: SettingsPersisting {
 private final class HotkeyRegistrationSpy: HotkeyRegistering {
     private let failingDescriptor: HotkeyDescriptor?
     private(set) var registrations: [HotkeyDescriptor] = []
+    private(set) var unregisterCount = 0
 
     init(failingDescriptor: HotkeyDescriptor? = nil) {
         self.failingDescriptor = failingDescriptor
@@ -388,7 +596,38 @@ private final class HotkeyRegistrationSpy: HotkeyRegistering {
         if descriptor == failingDescriptor { throw TestError.rejected }
     }
 
-    func unregister() {}
+    func unregister() { unregisterCount += 1 }
+}
+
+private final class PermissionCheckingSpy: PermissionChecking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentResponses: [CapturePermissionStatus]
+    private let requestResponse: CapturePermissionStatus
+    private(set) var currentCount = 0
+    private(set) var requestCount = 0
+
+    init(
+        currentResponses: [CapturePermissionStatus],
+        requestResponse: CapturePermissionStatus
+    ) {
+        self.currentResponses = currentResponses
+        self.requestResponse = requestResponse
+    }
+
+    func currentStatus() async -> CapturePermissionStatus {
+        lock.withLock {
+            currentCount += 1
+            if currentResponses.count > 1 {
+                return currentResponses.removeFirst()
+            }
+            return currentResponses.first ?? requestResponse
+        }
+    }
+
+    func requestMissingPermissions() async -> CapturePermissionStatus {
+        lock.withLock { requestCount += 1 }
+        return requestResponse
+    }
 }
 
 @MainActor

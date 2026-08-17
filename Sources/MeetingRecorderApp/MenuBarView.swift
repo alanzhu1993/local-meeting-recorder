@@ -7,9 +7,14 @@ import SwiftUI
 final class MenuBarViewModel: ObservableObject {
     @Published private(set) var presentation: MenuBarPresentation
     @Published private(set) var audioLevels: AudioLevels
-    @Published var isRecovering: Bool
+    @Published var isRecovering: Bool {
+        didSet { refreshPreferredHeight() }
+    }
     @Published var recoveryMessage: String?
-    @Published var permissionMessage: String?
+    @Published var permissionMessage: String? {
+        didSet { refreshPreferredHeight() }
+    }
+    @Published private(set) var preferredHeight: CGFloat
 
     @Published private(set) var recordingRoot: URL
     private let coordinator: RecordingCoordinator?
@@ -25,6 +30,7 @@ final class MenuBarViewModel: ObservableObject {
         coordinator: RecordingCoordinator,
         recordingRoot: URL,
         now: @escaping () -> Date = Date.init,
+        onPrimaryAction: @escaping () -> Void,
         onOpenToday: @escaping () -> Void,
         onShowSettings: @escaping () -> Void
     ) {
@@ -32,15 +38,22 @@ final class MenuBarViewModel: ObservableObject {
         self.recordingRoot = recordingRoot
         self.now = now
         phase = coordinator.phase
-        presentation = MenuBarPresentation(
+        let initialPresentation = MenuBarPresentation(
             phase: coordinator.phase,
             elapsed: Self.elapsed(for: coordinator.phase, now: now())
         )
+        presentation = initialPresentation
         audioLevels = coordinator.audioLevels
         isRecovering = false
         recoveryMessage = nil
         permissionMessage = nil
-        onPrimaryAction = { Task { @MainActor in await coordinator.toggleRecording() } }
+        preferredHeight = Self.preferredHeight(
+            phase: coordinator.phase,
+            isRecovering: false,
+            permissionMessage: nil,
+            warningText: initialPresentation.warningText
+        )
+        self.onPrimaryAction = onPrimaryAction
         self.onOpenToday = onOpenToday
         self.onShowSettings = onShowSettings
 
@@ -65,11 +78,18 @@ final class MenuBarViewModel: ObservableObject {
         self.recordingRoot = recordingRoot
         now = Date.init
         self.phase = phase
-        presentation = MenuBarPresentation(phase: phase, elapsed: elapsed)
+        let initialPresentation = MenuBarPresentation(phase: phase, elapsed: elapsed)
+        presentation = initialPresentation
         self.audioLevels = audioLevels
         self.isRecovering = isRecovering
         self.recoveryMessage = recoveryMessage
         self.permissionMessage = permissionMessage
+        preferredHeight = Self.preferredHeight(
+            phase: phase,
+            isRecovering: isRecovering,
+            permissionMessage: permissionMessage,
+            warningText: initialPresentation.warningText
+        )
         onPrimaryAction = {}
         onOpenToday = {}
         onShowSettings = {}
@@ -94,13 +114,46 @@ final class MenuBarViewModel: ObservableObject {
         recordingRoot = root
     }
 
+    var showsAudioMeter: Bool {
+        if case .recording = phase { return true }
+        return false
+    }
+
     private func update(phase: RecordingPhase) {
         self.phase = phase
         presentation = MenuBarPresentation(
             phase: phase,
             elapsed: Self.elapsed(for: phase, now: now())
         )
+        refreshPreferredHeight()
         updateTimer(for: phase)
+    }
+
+    private func refreshPreferredHeight() {
+        preferredHeight = Self.preferredHeight(
+            phase: phase,
+            isRecovering: isRecovering,
+            permissionMessage: permissionMessage,
+            warningText: presentation.warningText
+        )
+    }
+
+    private static func preferredHeight(
+        phase: RecordingPhase,
+        isRecovering: Bool,
+        permissionMessage: String?,
+        warningText: String?
+    ) -> CGFloat {
+        if isRecovering || permissionMessage != nil || warningText != nil {
+            return 470
+        }
+        switch phase {
+        case .idle: return 370
+        case .preparing: return 340
+        case .recording: return 430
+        case .stopping: return 370
+        case .failed: return 430
+        }
     }
 
     private func updateTimer(for phase: RecordingPhase) {
@@ -156,86 +209,91 @@ struct MenuBarView: View {
     @ObservedObject var model: MenuBarViewModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                header
-                VStack(alignment: .leading, spacing: 14) {
-                    statusSummary
-
-                    if model.isRecovering {
-                        notice(
-                            title: "正在恢复录音",
-                            detail: model.recoveryMessage ?? "正在检查上次中断的录音，请稍候。",
-                            color: AppColors.warning
-                        )
-                    }
-
-                    if let warning = model.presentation.warningText {
-                        notice(title: "麦克风提醒", detail: warning, color: AppColors.warning)
-                    }
-
-                    if let error = model.presentation.errorText {
-                        notice(title: model.presentation.statusText, detail: error, color: AppColors.warning)
-                    }
-
-                    if let permission = model.permissionMessage,
-                       model.presentation.errorText == nil {
-                        notice(title: "录音权限", detail: permission, color: AppColors.warning)
-                    }
-
-                    if model.permissionMessage != nil {
-                        Text("请只录制你有权录制的会议。")
-                            .font(.system(size: 11))
-                            .foregroundStyle(AppColors.ink3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if isRecordingLike {
-                        AudioMeterView(
-                            systemLevel: model.audioLevels.system,
-                            microphoneLevel: model.audioLevels.microphone,
-                            microphoneHasWarning: model.presentation.warningText != nil
-                        )
-                    }
-
-                    Button(action: model.performPrimaryAction) {
-                        Text(model.isRecovering ? "正在恢复…" : model.presentation.primaryActionTitle)
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(PrimaryRecordingButtonStyle(isRecording: isRecording))
-                    .disabled(model.isRecovering || !model.presentation.isPrimaryActionEnabled)
-                    .accessibilityLabel(model.isRecovering ? "正在恢复录音，暂时不能开始" : model.presentation.primaryActionTitle)
-
-                    VStack(spacing: 0) {
-                        utilityButton("打开今天的录音", systemImage: "folder", action: model.openToday)
-                        Divider().overlay(AppColors.line)
-                        utilityButton("设置", systemImage: "gearshape", action: model.showSettings)
-                    }
-                    .background(AppColors.surface)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.line, lineWidth: 1))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-
-                    if model.presentation.errorText == nil, model.permissionMessage == nil {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("保存到")
-                                .font(.system(size: 11))
-                                .foregroundStyle(AppColors.ink3)
-                            Text(model.recordingRoot.path)
-                                .font(.system(size: 11))
-                                .foregroundStyle(AppColors.ink2)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .textSelection(.enabled)
-                        }
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel("录音保存到 \(model.recordingRoot.path)")
-                    }
-                }
-                .padding(16)
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            statusSummary
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+            ScrollView {
+                secondaryContent
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
             }
         }
-        .frame(width: 292)
-        .frame(maxHeight: 470)
+        .frame(width: 292, height: model.preferredHeight)
         .background(AppColors.page)
+    }
+
+    private var secondaryContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if model.isRecovering {
+                notice(
+                    title: "正在恢复录音",
+                    detail: model.recoveryMessage ?? "正在检查上次中断的录音，请稍候。"
+                )
+            }
+
+            if let warning = model.presentation.warningText {
+                notice(title: "麦克风提醒", detail: warning)
+            }
+
+            if let error = model.presentation.errorText {
+                notice(title: model.presentation.statusText, detail: error)
+            }
+
+            if let permission = model.permissionMessage,
+               model.presentation.errorText == nil {
+                notice(title: "录音权限", detail: permission)
+            }
+
+            if model.permissionMessage != nil {
+                Text("请只录制你有权录制的会议。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(AppColors.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if model.showsAudioMeter {
+                AudioMeterView(
+                    systemLevel: model.audioLevels.system,
+                    microphoneLevel: model.audioLevels.microphone,
+                    microphoneHasWarning: model.presentation.warningText != nil
+                )
+            }
+
+            Button(action: model.performPrimaryAction) {
+                Text(model.isRecovering ? "正在恢复…" : model.presentation.primaryActionTitle)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(PrimaryRecordingButtonStyle(isRecording: isRecording))
+            .disabled(model.isRecovering || !model.presentation.isPrimaryActionEnabled)
+            .accessibilityLabel(model.isRecovering ? "正在恢复录音，暂时不能开始" : model.presentation.primaryActionTitle)
+
+            VStack(spacing: 0) {
+                utilityButton("打开今天的录音", systemImage: "folder", action: model.openToday)
+                Divider().overlay(AppColors.line)
+                utilityButton("设置", systemImage: "gearshape", action: model.showSettings)
+            }
+            .background(AppColors.surface)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.line, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            if model.presentation.errorText == nil, model.permissionMessage == nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("保存到")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AppColors.ink3)
+                    Text(model.recordingRoot.path)
+                        .font(.system(size: 11))
+                        .foregroundStyle(AppColors.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("录音保存到 \(model.recordingRoot.path)")
+            }
+        }
     }
 
     private var header: some View {
@@ -277,11 +335,11 @@ struct MenuBarView: View {
         .accessibilityLabel(model.presentation.accessibilityLabel)
     }
 
-    private func notice(title: String, detail: String, color: Color) -> some View {
+    private func notice(title: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(color)
+                .foregroundStyle(AppColors.warningText)
             Text(detail)
                 .font(.system(size: 12))
                 .foregroundStyle(AppColors.ink2)
@@ -320,13 +378,6 @@ struct MenuBarView: View {
         return false
     }
 
-    private var isRecordingLike: Bool {
-        switch model.presentationState {
-        case .recording, .stopping: true
-        case .idle, .preparing, .failed: false
-        }
-    }
-
     private var statusColor: Color {
         if model.isRecovering { return AppColors.warning }
         switch model.presentation.tone {
@@ -344,17 +395,24 @@ private extension MenuBarViewModel {
 
 private struct PrimaryRecordingButtonStyle: ButtonStyle {
     let isRecording: Bool
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(Color.white)
+            .foregroundStyle(isEnabled ? Color.white : AppColors.ink3)
             .frame(height: 32)
-            .background(
-                configuration.isPressed
-                    ? (isRecording ? AppColors.recording.opacity(0.82) : AppColors.ink.opacity(0.82))
-                    : (isRecording ? AppColors.recording : AppColors.ink)
+            .background(background(configuration: configuration))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(isEnabled ? Color.clear : AppColors.line, lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: 5))
+    }
+
+    private func background(configuration: Configuration) -> Color {
+        guard isEnabled else { return AppColors.subtleSurface }
+        let active = isRecording ? AppColors.recording : AppColors.ink
+        return configuration.isPressed ? active.opacity(0.82) : active
     }
 }

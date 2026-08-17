@@ -14,10 +14,12 @@ extension AppSettingsStore: SettingsPersisting {}
 @MainActor
 final class SettingsViewModel: ObservableObject {
     @Published private(set) var settings: AppSettings
+    @Published private(set) var launchAtLoginIsEnabled: Bool
     @Published var errorMessage: String?
 
     private let persistence: any SettingsPersisting
     private let hotkey: any HotkeyRegistering
+    private let hotkeyTeardownError: () -> Error?
     private let loginItem: any LoginItemManaging
     private let hotkeyAction: @Sendable () -> Void
 
@@ -25,12 +27,15 @@ final class SettingsViewModel: ObservableObject {
         initialSettings: AppSettings,
         persistence: any SettingsPersisting,
         hotkey: any HotkeyRegistering,
+        hotkeyTeardownError: @escaping () -> Error? = { nil },
         loginItem: any LoginItemManaging,
         hotkeyAction: @escaping @Sendable () -> Void = {}
     ) {
         settings = initialSettings
+        launchAtLoginIsEnabled = loginItem.isEnabled
         self.persistence = persistence
         self.hotkey = hotkey
+        self.hotkeyTeardownError = hotkeyTeardownError
         self.loginItem = loginItem
         self.hotkeyAction = hotkeyAction
     }
@@ -46,6 +51,10 @@ final class SettingsViewModel: ObservableObject {
         let previous = settings.hotkey
         errorMessage = nil
         hotkey.unregister()
+        if let teardownError = hotkeyTeardownError() {
+            errorMessage = "无法安全移除旧快捷键。请重启应用后再修改：\(teardownError.localizedDescription)"
+            return
+        }
         do {
             try hotkey.register(descriptor, handler: hotkeyAction)
             settings.hotkey = descriptor
@@ -66,18 +75,24 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
-        guard enabled != settings.launchAtLogin else { return }
-        let previous = settings.launchAtLogin
+        guard enabled != launchAtLoginIsEnabled else { return }
+        let previousExpectation = settings.launchAtLogin
         errorMessage = nil
         do {
             try loginItem.setEnabled(enabled)
+            launchAtLoginIsEnabled = loginItem.isEnabled
             settings.launchAtLogin = enabled
             persistence.save(settings)
         } catch {
-            settings.launchAtLogin = previous
+            launchAtLoginIsEnabled = loginItem.isEnabled
+            settings.launchAtLogin = previousExpectation
             persistence.save(settings)
             errorMessage = error.localizedDescription
         }
+    }
+
+    func refreshSystemState() {
+        launchAtLoginIsEnabled = loginItem.isEnabled
     }
 
     static var preview: SettingsViewModel {
@@ -95,86 +110,88 @@ struct SettingsView: View {
     @ObservedObject var model: SettingsViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("设置")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(AppColors.ink)
-                Text("只保存在这台 Mac 上")
-                    .font(.system(size: 12))
-                    .foregroundStyle(AppColors.ink3)
-            }
-
-            settingSection(title: "保存位置") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(model.settings.recordingRoot.path)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("设置")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundStyle(AppColors.ink)
+                    Text("只保存在这台 Mac 上")
                         .font(.system(size: 12))
-                        .foregroundStyle(AppColors.ink2)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityLabel("当前保存位置：\(model.settings.recordingRoot.path)")
-                    Button("选择文件夹…", action: chooseFolder)
-                        .buttonStyle(SecondaryButtonStyle())
-                        .accessibilityLabel("选择录音保存文件夹")
-                    Text("修改后将在下次启动时生效。")
-                        .font(.system(size: 11))
                         .foregroundStyle(AppColors.ink3)
                 }
-            }
 
-            settingSection(title: "快捷键") {
-                VStack(alignment: .leading, spacing: 6) {
-                    ShortcutRecorderView(
-                        displayText: model.settings.hotkey.displayText,
-                        onCapture: model.applyHotkey,
-                        onError: { model.errorMessage = $0 }
-                    )
-                    Text("点击后按新组合键。必须包含 Control 或 Command；按 Esc 取消。")
-                        .font(.system(size: 11))
-                        .foregroundStyle(AppColors.ink3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            settingSection(title: "启动") {
-                Button {
-                    model.setLaunchAtLogin(!model.settings.launchAtLogin)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: model.settings.launchAtLogin ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(model.settings.launchAtLogin ? AppColors.ink : AppColors.ink3)
-                        Text("登录 Mac 时自动启动")
-                            .font(.system(size: 13))
-                            .foregroundStyle(AppColors.ink)
+                settingSection(title: "保存位置") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(model.settings.recordingRoot.path)
+                            .font(.system(size: 12))
+                            .foregroundStyle(AppColors.ink2)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("当前保存位置：\(model.settings.recordingRoot.path)")
+                        Button("选择文件夹…", action: chooseFolder)
+                            .buttonStyle(SecondaryButtonStyle())
+                            .accessibilityLabel("选择录音保存文件夹")
+                        Text("修改后将在下次启动时生效。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(AppColors.ink3)
                     }
                 }
-                .buttonStyle(.plain)
-                .focusable(true)
-                .accessibilityLabel("登录 Mac 时自动启动会议录音")
-                .accessibilityValue(model.settings.launchAtLogin ? "已开启" : "已关闭")
-            }
 
-            if let errorMessage = model.errorMessage {
-                Text(errorMessage)
-                    .font(.system(size: 12))
-                    .foregroundStyle(AppColors.warning)
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(AppColors.warningSurface)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.warningBorder, lineWidth: 1))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("设置错误：\(errorMessage)")
-            }
+                settingSection(title: "快捷键") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ShortcutRecorderView(
+                            displayText: model.settings.hotkey.displayText,
+                            onCapture: model.applyHotkey,
+                            onError: { model.errorMessage = $0 }
+                        )
+                        Text("点击后按新组合键。必须包含 Control 或 Command；按 Esc 取消。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(AppColors.ink3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
 
-            Spacer(minLength: 0)
+                settingSection(title: "启动") {
+                    Button {
+                        model.setLaunchAtLogin(!model.launchAtLoginIsEnabled)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: model.launchAtLoginIsEnabled ? "checkmark.square.fill" : "square")
+                                .foregroundStyle(model.launchAtLoginIsEnabled ? AppColors.ink : AppColors.ink3)
+                            Text("登录 Mac 时自动启动")
+                                .font(.system(size: 13))
+                                .foregroundStyle(AppColors.ink)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .focusable(true)
+                    .accessibilityLabel("登录 Mac 时自动启动会议录音")
+                    .accessibilityValue(model.launchAtLoginIsEnabled ? "已开启" : "已关闭")
+                }
+
+                if let errorMessage = model.errorMessage {
+                    Text(errorMessage)
+                        .font(.system(size: 12))
+                        .foregroundStyle(AppColors.warningText)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(AppColors.warningSurface)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.warningBorder, lineWidth: 1))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel("设置错误：\(errorMessage)")
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(24)
         }
-        .padding(24)
         .frame(
             minWidth: 420,
             idealWidth: 480,
             maxWidth: 480,
-            minHeight: 370,
+            minHeight: 600,
             alignment: .topLeading
         )
         .background(AppColors.page)
@@ -221,6 +238,7 @@ enum AppColors {
     static let line = Color(red: 215 / 255, green: 219 / 255, blue: 227 / 255)
     static let recording = Color(red: 168 / 255, green: 68 / 255, blue: 60 / 255)
     static let warning = Color(red: 141 / 255, green: 107 / 255, blue: 63 / 255)
+    static let warningText = Color(red: 102 / 255, green: 75 / 255, blue: 39 / 255)
     static let success = Color(red: 91 / 255, green: 143 / 255, blue: 114 / 255)
     static let warningSurface = Color(red: 248 / 255, green: 243 / 255, blue: 234 / 255)
     static let warningBorder = Color(red: 227 / 255, green: 215 / 255, blue: 196 / 255)
