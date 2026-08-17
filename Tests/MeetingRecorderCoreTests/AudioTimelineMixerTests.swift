@@ -97,6 +97,105 @@ final class AudioTimelineMixerTests: XCTestCase {
         }
     }
 
+    func testConvertsConsecutive48kFloat32StereoBuffersWithoutChangingFramesOrSamples() throws {
+        let converter = SampleBufferConverter()
+        let origin = CMTime(value: 10_000, timescale: 48_000)
+        var firstValues: [Float] = []
+        var secondValues: [Float] = []
+        firstValues.reserveCapacity(1_920)
+        secondValues.reserveCapacity(1_920)
+        for frame in 0..<960 {
+            firstValues.append(Float(frame % 16) / 16 - 0.5)
+            firstValues.append(Float(frame % 20) / 20 - 0.5)
+            secondValues.append(0.5 - Float(frame % 20) / 20)
+            secondValues.append(0.5 - Float(frame % 16) / 16)
+        }
+        let inputChunks = [firstValues, secondValues]
+        var chunks: [PCMChunk] = []
+
+        for (index, values) in inputChunks.enumerated() {
+            let presentationTime = origin + CMTime(value: Int64(index * 960), timescale: 48_000)
+            let buffer = try AudioTestFactory.float32InterleavedSampleBuffer(
+                sampleRate: 48_000,
+                channels: 2,
+                values: values,
+                presentationTime: presentationTime
+            )
+            chunks.append(try converter.convert(
+                CapturedAudioSample(
+                    source: .system,
+                    buffer: buffer,
+                    presentationTime: presentationTime
+                ),
+                sessionStartPTS: origin
+            ))
+        }
+
+        XCTAssertEqual(chunks.map(\.frameCount), [960, 960])
+        XCTAssertEqual(chunks.map(\.startFrame), [0, 960])
+        XCTAssertFloatArraysEqual(chunks.flatMap(\.samples), inputChunks.flatMap { $0 })
+    }
+
+    func testConverts48kInt16StereoWithOneOutputFramePerInputFrame() throws {
+        var values: [Int16] = []
+        values.reserveCapacity(1_920)
+        for frame in 0..<960 {
+            values.append(Int16((frame % 64) * 512 - 16_384))
+            values.append(Int16(16_384 - (frame % 64) * 512))
+        }
+        let presentationTime = CMTime(value: 24_000, timescale: 48_000)
+        let buffer = try AudioTestFactory.int16InterleavedSampleBuffer(
+            sampleRate: 48_000,
+            channels: 2,
+            values: values,
+            presentationTime: presentationTime
+        )
+
+        let chunk = try SampleBufferConverter().convert(
+            CapturedAudioSample(
+                source: .system,
+                buffer: buffer,
+                presentationTime: presentationTime
+            ),
+            sessionStartPTS: presentationTime
+        )
+
+        XCTAssertEqual(chunk.frameCount, 960)
+        XCTAssertEqual(chunk.startFrame, 0)
+        XCTAssertFloatArraysEqual(chunk.samples, values.map { Float($0) / 32_768 })
+    }
+
+    func testConverts48kInt16MonoWithOneOutputFramePerInputFrame() throws {
+        let values: [Int16] = (0..<960).map { frame in
+            Int16((frame % 64) * 512 - 16_384)
+        }
+        let presentationTime = CMTime(value: 72_000, timescale: 48_000)
+        let buffer = try AudioTestFactory.int16MonoSampleBuffer(
+            sampleRate: 48_000,
+            values: values,
+            presentationTime: presentationTime
+        )
+
+        let chunk = try SampleBufferConverter().convert(
+            CapturedAudioSample(
+                source: .microphone,
+                buffer: buffer,
+                presentationTime: presentationTime
+            ),
+            sessionStartPTS: presentationTime
+        )
+
+        XCTAssertEqual(chunk.frameCount, values.count)
+        XCTAssertEqual(chunk.startFrame, 0)
+        XCTAssertFloatArraysEqual(
+            chunk.samples,
+            values.flatMap { value in
+                let normalized = Float(value) / 32_768
+                return [normalized, normalized]
+            }
+        )
+    }
+
     func testFramePositionRoundsAtOutputSampleRate() {
         XCTAssertEqual(
             AudioTimeline.framePosition(

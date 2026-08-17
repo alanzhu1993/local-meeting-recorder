@@ -61,15 +61,68 @@ enum AudioTestFactory {
         values: [Int16],
         presentationTime: CMTime
     ) throws -> CMSampleBuffer {
+        try int16InterleavedSampleBuffer(
+            sampleRate: sampleRate,
+            channels: 1,
+            values: values,
+            presentationTime: presentationTime
+        )
+    }
+
+    static func int16InterleavedSampleBuffer(
+        sampleRate: Double,
+        channels: UInt32,
+        values: [Int16],
+        presentationTime: CMTime
+    ) throws -> CMSampleBuffer {
+        try linearPCMSampleBuffer(
+            sampleRate: sampleRate,
+            channels: channels,
+            values: values,
+            formatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            bitsPerChannel: 16,
+            presentationTime: presentationTime
+        )
+    }
+
+    static func float32InterleavedSampleBuffer(
+        sampleRate: Double,
+        channels: UInt32,
+        values: [Float],
+        presentationTime: CMTime
+    ) throws -> CMSampleBuffer {
+        try linearPCMSampleBuffer(
+            sampleRate: sampleRate,
+            channels: channels,
+            values: values,
+            formatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            bitsPerChannel: 32,
+            presentationTime: presentationTime
+        )
+    }
+
+    private static func linearPCMSampleBuffer<Sample>(
+        sampleRate: Double,
+        channels: UInt32,
+        values: [Sample],
+        formatFlags: AudioFormatFlags,
+        bitsPerChannel: UInt32,
+        presentationTime: CMTime
+    ) throws -> CMSampleBuffer {
+        guard channels > 0, !values.isEmpty, values.count.isMultiple(of: Int(channels)) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSValidationErrorMinimum)
+        }
+        let bytesPerSample = UInt32(MemoryLayout<Sample>.size)
+        let bytesPerFrame = bytesPerSample * channels
         var description = AudioStreamBasicDescription(
             mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kLinearPCMFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: UInt32(MemoryLayout<Int16>.size),
+            mFormatFlags: formatFlags,
+            mBytesPerPacket: bytesPerFrame,
             mFramesPerPacket: 1,
-            mBytesPerFrame: UInt32(MemoryLayout<Int16>.size),
-            mChannelsPerFrame: 1,
-            mBitsPerChannel: 16,
+            mBytesPerFrame: bytesPerFrame,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: bitsPerChannel,
             mReserved: 0
         )
         var formatDescription: CMAudioFormatDescription?
@@ -87,7 +140,7 @@ enum AudioTestFactory {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(formatStatus))
         }
 
-        let byteCount = values.count * MemoryLayout<Int16>.size
+        let byteCount = values.count * MemoryLayout<Sample>.size
         var blockBuffer: CMBlockBuffer?
         let blockStatus = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -123,7 +176,7 @@ enum AudioTestFactory {
             makeDataReadyCallback: nil,
             refcon: nil,
             formatDescription: formatDescription,
-            sampleCount: values.count,
+            sampleCount: values.count / Int(channels),
             presentationTimeStamp: presentationTime,
             packetDescriptions: nil,
             sampleBufferOut: &sampleBuffer
