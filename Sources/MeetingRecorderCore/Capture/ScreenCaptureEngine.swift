@@ -113,6 +113,10 @@ public actor ScreenCaptureEngine: AudioCapturing {
                     lifecycle = .idle
                     session.delivery.finish()
                 }
+            } else if owns(session, in: lifecycle, phase: .stopping) {
+                let cleanup = beginStopping(session)
+                let stopFailure = await cleanup.value
+                completeStop(of: session, stopFailure: stopFailure)
             }
             if wasCancelled {
                 throw CancellationError()

@@ -58,9 +58,12 @@ final class ScreenCaptureEngineTests: XCTestCase {
         let second = TestBackendControl()
         let factory = TestBackendFactory([first, second])
         let engine = ScreenCaptureEngine(backendFactory: factory.make)
+        let firstSessionEvents = TestEventRecorder()
 
         let firstStart = Task {
-            try await engine.start { _ in }
+            try await engine.start { event in
+                await firstSessionEvents.record(event)
+            }
         }
         await first.waitUntilStartEntered()
 
@@ -75,12 +78,15 @@ final class ScreenCaptureEngineTests: XCTestCase {
             try await firstStart.value
             XCTFail("A stopped in-flight start must not become running.")
         } catch {}
+        await firstSessionEvents.waitForStoppedEvent()
 
         try await engine.start { _ in }
         await engine.stop()
 
+        let stoppedEventCount = await firstSessionEvents.stoppedEventCount
         XCTAssertEqual(first.stopCallCount, 1)
         XCTAssertEqual(second.startCallCount, 1)
+        XCTAssertEqual(stoppedEventCount, 1)
     }
 
     func testCancellingStartCallerCleansSessionAndAllowsRestart() async throws {
@@ -116,6 +122,64 @@ final class ScreenCaptureEngineTests: XCTestCase {
         XCTAssertEqual(first.stopCallCount, 1)
         XCTAssertEqual(second.startCallCount, 1)
         XCTAssertEqual(cancelledStoppedEvents, 0)
+    }
+
+    func testCancelledStartWaitsForAbnormalStopCleanupBeforeReturning() async throws {
+        let first = TestBackendControl(
+            suspendsStart: true,
+            suspendsStop: true,
+            emitsStoppedWhenStartIsCancelled: true
+        )
+        let second = TestBackendControl()
+        let factory = TestBackendFactory([first, second])
+        let engine = ScreenCaptureEngine(backendFactory: factory.make)
+        let events = TestEventRecorder()
+        let cleanupReleased = TestLockedFlag()
+        let returnedBeforeCleanup = expectation(
+            description: "cancelled start returned before cleanup"
+        )
+        returnedBeforeCleanup.isInverted = true
+
+        let cancelledStart = Task {
+            let result: Result<Void, any Error>
+            do {
+                try await engine.start { event in
+                    await events.record(event)
+                }
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            if !cleanupReleased.value {
+                returnedBeforeCleanup.fulfill()
+            }
+            return result
+        }
+        await first.waitUntilStartEntered()
+
+        cancelledStart.cancel()
+        first.openStartGate()
+        await first.waitUntilStopEntered()
+        await fulfillment(of: [returnedBeforeCleanup], timeout: 0.05)
+
+        cleanupReleased.setTrue()
+        first.openStopGate()
+        let result = await cancelledStart.value
+        if case .success = result {
+            XCTFail("Cancelled start must fail after cleanup.")
+        }
+        if case let .failure(error) = result {
+            XCTAssertTrue(error is CancellationError)
+        }
+        await events.waitForStoppedEvent()
+
+        try await engine.start { _ in }
+        await engine.stop()
+
+        let stoppedEventCount = await events.stoppedEventCount
+        XCTAssertEqual(first.stopCallCount, 1)
+        XCTAssertEqual(stoppedEventCount, 1)
+        XCTAssertEqual(second.startCallCount, 1)
     }
 
     func testUnexpectedStopCleansUpOnceAndAllowsRestart() async throws {
@@ -248,6 +312,7 @@ private final class TestBackendControl: @unchecked Sendable {
     private let lock = NSLock()
     private let suspendsStart: Bool
     private let suspendsStop: Bool
+    private let emitsStoppedWhenStartIsCancelled: Bool
     private let startEntered = AsyncStream<Void>.makeStream()
     private let startCancelled = AsyncStream<Void>.makeStream()
     private let stopEntered = AsyncStream<Void>.makeStream()
@@ -258,9 +323,14 @@ private final class TestBackendControl: @unchecked Sendable {
     private var _startCancellationCount = 0
     private var _stopCallCount = 0
 
-    init(suspendsStart: Bool = false, suspendsStop: Bool = false) {
+    init(
+        suspendsStart: Bool = false,
+        suspendsStop: Bool = false,
+        emitsStoppedWhenStartIsCancelled: Bool = false
+    ) {
         self.suspendsStart = suspendsStart
         self.suspendsStop = suspendsStop
+        self.emitsStoppedWhenStartIsCancelled = emitsStoppedWhenStartIsCancelled
     }
 
     var startCallCount: Int {
@@ -322,6 +392,12 @@ private final class TestBackendControl: @unchecked Sendable {
             self.lock.withLock { self._startCancellationCount += 1 }
             self.startCancelled.continuation.yield()
         }
+        if Task.isCancelled, emitsStoppedWhenStartIsCancelled {
+            await emit(.stopped(RecordingFailure(
+                code: .capture,
+                message: "test backend stopped during cancelled start"
+            )))
+        }
         try Task.checkCancellation()
     }
 
@@ -373,6 +449,19 @@ private actor TestAsyncGate {
         let waiting = continuations
         continuations.removeAll()
         waiting.forEach { $0.resume() }
+    }
+}
+
+private final class TestLockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.withLock { storage }
+    }
+
+    func setTrue() {
+        lock.withLock { storage = true }
     }
 }
 
