@@ -128,3 +128,12 @@
 - Release app 构建成功；可执行文件为 arm64 Mach-O，ad-hoc 签名，`codesign --verify --deep --strict` 通过，bundle id 为 `com.alan.local-meeting-recorder`，`LSUIElement=true`。
 - `zsh -n scripts/install-local.sh` 和 `git diff --check` 通过。
 - 按 FixRound3 要求，本轮没有运行真实安装，没有停止进程，没有移动 `/Users/alan/Applications/会议录音.app`；只读复核 target 仍为 inode `126288769`、mtime `1786985951`，与 FixRound2 前一致，且没有匹配该精确 executable path 的运行进程。
+
+## FixRound3 复审通过后的真实安装（2026-08-18）
+
+- scoped re-review 对临时录音目录隔离、menu/hotkey 共享 permission request、action/session 共用 injected permission、AppDelegate 默认生产路径和测试注入边界逐项给出 `ADDRESSED`；Spec 与 Quality 均为 PASS，没有新的 Critical/Important 问题。
+- 从当前 `aaa719b` 重新执行 Release 构建并成功安装到 `/Users/alan/Applications/会议录音.app`。
+- 安装脚本先把旧版本完整保留为 `/Users/alan/Applications/会议录音-backup-2026-08-18-022245.app`，再复制、校验并启动新版本；全程没有使用 TERM/KILL。
+- 安装后 `codesign --verify --deep --strict` 通过；bundle id 为 `com.alan.local-meeting-recorder`，`LSUIElement=true`，可执行文件为 arm64 Mach-O。
+- 新进程 PID 为 `10108`，可执行路径精确为 `/Users/alan/Applications/会议录音.app/Contents/MacOS/MeetingRecorderApp`。
+- System Events 返回 `frontmost=false, visible=false, menuBars=1`，与纯菜单栏应用预期一致。
