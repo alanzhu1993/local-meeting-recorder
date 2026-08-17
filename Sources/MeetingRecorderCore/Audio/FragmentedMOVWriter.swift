@@ -6,15 +6,18 @@ struct FragmentedMOVWriterHooks: Sendable {
     let readiness: (@Sendable () -> Bool)?
     let readinessTimeout: Duration
     let beforeRecovery: (@Sendable () async throws -> Void)?
+    let afterRecoveryCommitted: (@Sendable () async throws -> Void)?
 
     init(
         readiness: (@Sendable () -> Bool)? = nil,
         readinessTimeout: Duration = .seconds(5),
-        beforeRecovery: (@Sendable () async throws -> Void)? = nil
+        beforeRecovery: (@Sendable () async throws -> Void)? = nil,
+        afterRecoveryCommitted: (@Sendable () async throws -> Void)? = nil
     ) {
         self.readiness = readiness
         self.readinessTimeout = readinessTimeout
         self.beforeRecovery = beforeRecovery
+        self.afterRecoveryCommitted = afterRecoveryCommitted
     }
 }
 
@@ -215,10 +218,14 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
             try Task.checkCancellation()
             try await hooks.beforeRecovery?()
             try Task.checkCancellation()
-            return try await M4AFinalizer().recover(
+            let output = try await M4AFinalizer().recover(
                 workingURL: workingURL,
                 recoveredURL: finalURL
             )
+            session.markCommitted(output)
+            try await hooks.afterRecoveryCommitted?()
+            try Task.checkCancellation()
+            return output
         }
         state = .finishing(session, token, finalURL)
         inFlight = InFlightOperation(
@@ -234,17 +241,32 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
                 finishTask.cancel()
             }
             guard ownsFinish(token) else {
+                if let committed = session.committedURL { return committed }
                 throw writeFailure("Finish completed after another operation took ownership.")
             }
             inFlight = nil
             state = .finished(output)
             return output
         } catch let failure as RecordingFailure {
+            if let committed = session.committedURL {
+                if ownsFinish(token) {
+                    inFlight = nil
+                    state = .finished(committed)
+                }
+                return committed
+            }
             guard ownsFinish(token) else { throw failure }
             inFlight = nil
             state = .failed(session)
             throw failure
         } catch {
+            if let committed = session.committedURL {
+                if ownsFinish(token) {
+                    inFlight = nil
+                    state = .finished(committed)
+                }
+                return committed
+            }
             guard ownsFinish(token) else {
                 throw writeFailure("Finish was cancelled because the writer was aborted.")
             }
@@ -267,23 +289,18 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
         }
 
         let session: WriterSession
-        let committedURL: URL?
         switch state {
         case .idle:
             state = .aborted
             return
         case let .writing(current):
             session = current
-            committedURL = nil
         case let .appending(current, _):
             session = current
-            committedURL = nil
-        case let .finishing(current, _, finalURL):
+        case let .finishing(current, _, _):
             session = current
-            committedURL = finalURL
         case let .failed(current?):
             session = current
-            committedURL = nil
         case .failed(nil), .aborted:
             state = .aborted
             return
@@ -298,7 +315,9 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
         operation?.cancel()
         let task = Task {
             await operation?.wait()
-            await Self.preserveWorkingFile(session)
+            if session.committedURL == nil {
+                await Self.preserveWorkingFile(session)
+            }
         }
         abortTask = task
         state = .aborting(session, token)
@@ -307,9 +326,7 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
         guard ownsAbort(token) else { return }
         inFlight = nil
         abortTask = nil
-        if let committedURL,
-           FileManager.default.fileExists(atPath: committedURL.path),
-           !FileManager.default.fileExists(atPath: workingURL.path) {
+        if let committedURL = session.committedURL {
             state = .finished(committedURL)
         } else {
             state = .aborted
@@ -494,9 +511,21 @@ public actor FragmentedMOVWriter: RecoverableAudioWriting {
 private final class WriterSession: @unchecked Sendable {
     let writer: AVAssetWriter
     let input: AVAssetWriterInput
+    private let committedLock = NSLock()
+    private var committedOutput: URL?
+
+    var committedURL: URL? {
+        committedLock.withLock { committedOutput }
+    }
 
     init(writer: AVAssetWriter, input: AVAssetWriterInput) {
         self.writer = writer
         self.input = input
+    }
+
+    func markCommitted(_ url: URL) {
+        committedLock.withLock {
+            committedOutput = url
+        }
     }
 }

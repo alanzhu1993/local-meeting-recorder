@@ -353,6 +353,227 @@ final class RecoverableWriterTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(duration), 0.19)
     }
 
+    func testHardLinkAliasesShareOneDeterministicRecoveryClaim() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let aliasURL = directory.appendingPathComponent("working-alias.mov")
+        let firstURL = directory.appendingPathComponent("first.m4a")
+        let secondURL = directory.appendingPathComponent("second.m4a")
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        try FileManager.default.linkItem(at: workingURL, to: aliasURL)
+
+        let firstClaimGate = TestAsyncGate()
+        let secondContended = TestSignal()
+        let firstFinalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            afterClaimAcquired: { await firstClaimGate.suspend() }
+        ))
+        let secondFinalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            onClaimContention: { secondContended.signal() }
+        ))
+        let firstTask = Task {
+            try await firstFinalizer.recover(
+                workingURL: workingURL,
+                recoveredURL: firstURL
+            )
+        }
+        await firstClaimGate.waitUntilEntered()
+        let secondTask = Task { () -> Bool in
+            do {
+                _ = try await secondFinalizer.recover(
+                    workingURL: aliasURL,
+                    recoveredURL: secondURL
+                )
+                return true
+            } catch {
+                return false
+            }
+        }
+        XCTAssertTrue(secondContended.wait())
+
+        await firstClaimGate.open()
+        let firstOutput = try await firstTask.value
+        let secondSucceeded = await secondTask.value
+        XCTAssertEqual(firstOutput, firstURL)
+        XCTAssertFalse(secondSucceeded)
+        XCTAssertEqual(
+            [firstURL, secondURL].filter {
+                FileManager.default.fileExists(atPath: $0.path)
+            }.count,
+            1
+        )
+    }
+
+    func testPublishedOutputSucceedsDespiteCleanupFailureAndCannotRepublish() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let firstURL = directory.appendingPathComponent("first.m4a")
+        let secondURL = directory.appendingPathComponent("second.m4a")
+        let writer = FragmentedMOVWriter(workingURL: workingURL)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        await writer.abort()
+        let finalizer = M4AFinalizer(hooks: M4AFinalizerHooks(
+            cleanupSource: { _ in
+                throw RecordingFailure(code: .finalize, message: "injected unlink failure")
+            }
+        ))
+
+        let output = try await finalizer.recover(
+            workingURL: workingURL,
+            recoveredURL: firstURL
+        )
+
+        XCTAssertEqual(output, firstURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+        do {
+            _ = try await M4AFinalizer().recover(
+                workingURL: workingURL,
+                recoveredURL: secondURL
+            )
+            XCTFail("A committed working inode must not publish a second output.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .finalize)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: secondURL.path))
+    }
+
+    func testSegmentedRecoverySkipsMissingCompletedSegmentAndPreservesGap() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("segmented.inprogress.mov")
+        let recoveredURL = directory.appendingPathComponent("recovered.m4a")
+        let writer = SegmentedM4AWriter(workingURL: workingURL, segmentFrames: 4_800)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        try await writer.append(.sine(startFrame: 4_800, frameCount: 4_800))
+        try await writer.append(.sine(startFrame: 9_600, frameCount: 4_800))
+        await writer.abort()
+        let missingURL = directory.appendingPathComponent(
+            ".segmented.inprogress.mov.segment-000001.m4a"
+        )
+        try FileManager.default.removeItem(at: missingURL)
+
+        _ = try await M4AFinalizer().recover(
+            workingURL: workingURL,
+            recoveredURL: recoveredURL
+        )
+
+        let duration = try await AVURLAsset(url: recoveredURL).load(.duration)
+        XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(duration), 0.29)
+    }
+
+    func testSegmentedRecoveryFallsBackWhenCurrentMovieIsDamaged() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("segmented.inprogress.mov")
+        let recoveredURL = directory.appendingPathComponent("recovered.m4a")
+        let writer = SegmentedM4AWriter(workingURL: workingURL, segmentFrames: 4_800)
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        try await writer.append(.sine(startFrame: 4_800, frameCount: 1))
+        await writer.abort()
+        let currentURL = directory.appendingPathComponent(
+            ".segmented.inprogress.mov.segment-000001.inprogress.mov"
+        )
+        try Data("damaged current movie".utf8).write(to: currentURL)
+
+        _ = try await M4AFinalizer().recover(
+            workingURL: workingURL,
+            recoveredURL: recoveredURL
+        )
+
+        let duration = try await AVURLAsset(url: recoveredURL).load(.duration)
+        XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(duration), 0.099)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workingURL.path))
+    }
+
+    func testFragmentedFinishReturnsCommittedOutputWhenAbortArrivesPostCommit() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let finalURL = directory.appendingPathComponent("final.m4a")
+        let suspension = TestAsyncSuspension()
+        let writer = FragmentedMOVWriter(
+            workingURL: workingURL,
+            hooks: FragmentedMOVWriterHooks(
+                afterRecoveryCommitted: { try await suspension.suspend() }
+            )
+        )
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        let finishTask = Task { try await writer.finish(finalURL: finalURL) }
+        await suspension.waitUntilEntered()
+
+        await writer.abort()
+
+        let finishOutput = try await finishTask.value
+        XCTAssertEqual(finishOutput, finalURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        do {
+            try await writer.append(.sine(startFrame: 4_800, frameCount: 960))
+            XCTFail("A committed writer must remain finished after abort returns.")
+        } catch {}
+    }
+
+    func testSegmentedFinishReturnsCommittedOutputWhenAbortArrivesPostCommit() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("segmented.inprogress.mov")
+        let finalURL = directory.appendingPathComponent("final.m4a")
+        let suspension = TestAsyncSuspension()
+        let writer = SegmentedM4AWriter(
+            workingURL: workingURL,
+            segmentFrames: 4_800,
+            hooks: SegmentedM4AWriterHooks(
+                afterRecoveryCommitted: { try await suspension.suspend() }
+            )
+        )
+        try await writer.start()
+        try await writer.append(.sine(startFrame: 0, frameCount: 4_800))
+        let finishTask = Task { try await writer.finish(finalURL: finalURL) }
+        await suspension.waitUntilEntered()
+
+        await writer.abort()
+
+        let finishOutput = try await finishTask.value
+        XCTAssertEqual(finishOutput, finalURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        do {
+            try await writer.append(.sine(startFrame: 4_800, frameCount: 960))
+            XCTFail("A committed segmented writer must remain finished.")
+        } catch {}
+    }
+
+    func testBackpressureTimeoutMapsToWriteFailure() async throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workingURL = directory.appendingPathComponent("working.mov")
+        let writer = FragmentedMOVWriter(
+            workingURL: workingURL,
+            hooks: FragmentedMOVWriterHooks(
+                readiness: { false },
+                readinessTimeout: .milliseconds(20)
+            )
+        )
+        try await writer.start()
+
+        do {
+            try await writer.append(.sine(startFrame: 0, frameCount: 960))
+            XCTFail("Expected bounded backpressure timeout.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .write)
+            XCTAssertTrue(failure.message.contains("Timed out"))
+        }
+        await writer.abort()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workingURL.path))
+    }
+
     private func makeTemporaryDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("meeting-recorder-writer-tests-\(UUID().uuidString)", isDirectory: true)
@@ -399,6 +620,41 @@ private actor TestAsyncSuspension {
         if entered { return }
         var iterator = enteredSignal.stream.makeAsyncIterator()
         _ = await iterator.next()
+    }
+}
+
+private actor TestAsyncGate {
+    private var entered = false
+    private let enteredSignal = AsyncStream<Void>.makeStream()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        entered = true
+        enteredSignal.continuation.yield()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        var iterator = enteredSignal.stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private final class TestSignal: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func signal() {
+        semaphore.signal()
+    }
+
+    func wait() -> Bool {
+        semaphore.wait(timeout: .now() + 2) == .success
     }
 }
 

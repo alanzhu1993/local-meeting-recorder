@@ -3,9 +3,14 @@ import Foundation
 
 struct SegmentedM4AWriterHooks: Sendable {
     let beforeSegmentAppend: (@Sendable () async throws -> Void)?
+    let afterRecoveryCommitted: (@Sendable () async throws -> Void)?
 
-    init(beforeSegmentAppend: (@Sendable () async throws -> Void)? = nil) {
+    init(
+        beforeSegmentAppend: (@Sendable () async throws -> Void)? = nil,
+        afterRecoveryCommitted: (@Sendable () async throws -> Void)? = nil
+    ) {
         self.beforeSegmentAppend = beforeSegmentAppend
+        self.afterRecoveryCommitted = afterRecoveryCommitted
     }
 }
 
@@ -186,16 +191,21 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
         }
         let token = UUID()
         let workingURL = self.workingURL
+        let hooks = self.hooks
         let operationTask = Task {
             try await Self.closeCurrentSegment(
                 session: session,
                 manifestURL: workingURL
             )
             try Task.checkCancellation()
-            return try await M4AFinalizer().recover(
+            let output = try await M4AFinalizer().recover(
                 workingURL: workingURL,
                 recoveredURL: finalURL
             )
+            session.markCommitted(output)
+            try await hooks.afterRecoveryCommitted?()
+            try Task.checkCancellation()
+            return output
         }
         state = .operating(session, token, finalURL)
         inFlight = InFlightOperation(
@@ -211,17 +221,32 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
                 operationTask.cancel()
             }
             guard ownsOperation(token) else {
+                if let committed = session.committedURL { return committed }
                 throw writeFailure("Segmented finish completed after another operation took ownership.")
             }
             inFlight = nil
             state = .finished(output)
             return output
         } catch let failure as RecordingFailure {
+            if let committed = session.committedURL {
+                if ownsOperation(token) {
+                    inFlight = nil
+                    state = .finished(committed)
+                }
+                return committed
+            }
             guard ownsOperation(token) else { throw failure }
             inFlight = nil
             state = .failed(session)
             throw failure
         } catch {
+            if let committed = session.committedURL {
+                if ownsOperation(token) {
+                    inFlight = nil
+                    state = .finished(committed)
+                }
+                return committed
+            }
             guard ownsOperation(token) else {
                 throw writeFailure("Segmented finish was cancelled because the writer was aborted.")
             }
@@ -244,20 +269,16 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
         }
 
         let session: SegmentedSession
-        let committedURL: URL?
         switch state {
         case .idle:
             state = .aborted
             return
         case let .running(current):
             session = current
-            committedURL = nil
-        case let .operating(current, _, finalURL):
+        case let .operating(current, _, _):
             session = current
-            committedURL = finalURL
         case let .failed(current?):
             session = current
-            committedURL = nil
         case .failed(nil), .aborted:
             state = .aborted
             return
@@ -272,7 +293,9 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
         operation?.cancel()
         let task = Task {
             await operation?.wait()
-            await session.currentSegment?.writer.abort()
+            if session.committedURL == nil {
+                await session.currentSegment?.writer.abort()
+            }
         }
         abortTask = task
         state = .aborting(session, token)
@@ -281,9 +304,7 @@ public actor SegmentedM4AWriter: RecoverableAudioWriting {
         guard ownsAbort(token) else { return }
         inFlight = nil
         abortTask = nil
-        if let committedURL,
-           FileManager.default.fileExists(atPath: committedURL.path),
-           !FileManager.default.fileExists(atPath: workingURL.path) {
+        if let committedURL = session.committedURL {
             state = .finished(committedURL)
         } else {
             state = .aborted
@@ -427,9 +448,21 @@ private final class SegmentedSession: @unchecked Sendable {
     var manifest: SegmentedRecordingManifest
     var currentSegment: Segment?
     var lastEndFrame: Int64?
+    private let committedLock = NSLock()
+    private var committedOutput: URL?
+
+    var committedURL: URL? {
+        committedLock.withLock { committedOutput }
+    }
 
     init(manifest: SegmentedRecordingManifest) {
         self.manifest = manifest
+    }
+
+    func markCommitted(_ url: URL) {
+        committedLock.withLock {
+            committedOutput = url
+        }
     }
 }
 
