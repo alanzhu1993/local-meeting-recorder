@@ -99,6 +99,17 @@ public final class HotkeyService: HotkeyRegistering {
         eventIdentifier = HotkeyIdentifierFactory.next()
     }
 
+    isolated deinit {
+        guard let resources else { return }
+        let unregisterStatus = backend.unregister(resources.registration)
+        guard unregisterStatus == noErr else {
+            retainContextForTerminalFailure(resources.handlerToken)
+            return
+        }
+        self.resources = nil
+        consumeHandlerRef(resources.handlerToken)
+    }
+
     public func register(_ descriptor: HotkeyDescriptor, handler: @escaping @Sendable () -> Void) throws {
         if let terminalTeardownError {
             throw terminalTeardownError

@@ -46,3 +46,11 @@
 - `LoginItemManaging`、`LoginItemService` 和注入 backend 同样改为 `@MainActor`，去除了 `@unchecked Sendable` 与锁内外部调用。注入 backend 可以在 `register()` 内重新读取或设置服务状态而不死锁；register 抛错后若状态为 `requiresApproval`，返回该明确错误而不是通用注册失败。
 - Round 2 新增测试覆盖：Remove 失败后不重复 Remove、终态不允许新注册、正常移除后可重新注册、MainActor 线性并发调用、backend 重入、以及错误后的 `requiresApproval` 映射。
 - 本轮验证：`PermissionServiceTests` 3/3、`HotkeyServiceTests` 8/8、`SystemServiceTests` 10/10；全量 `swift test -Xswiftc -warnings-as-errors` 为 92/92 通过，`git diff --check` 通过。
+
+## Fix Round 3（2026-08-17）
+
+- `HotkeyService` 使用 Swift 6.2 的 `isolated deinit` 在 MainActor 上完成安全清理。已注册实例释放时会先 `UnregisterEventHotKey`，再单次调用 `RemoveEventHandler`；后者失败仍依照终态规则保留 callback context，且不会再次移除同一 ref。注入测试模拟移除失败后仍可能被系统回调，验证它安全返回 `eventNotHandledErr`。
+- 登录启动改为主线程同步重入状态机，维护 `isMutating`、`activeDesired`、`pendingDesired`。同目标重入直接合并；相反目标记录为最后一个 pending 请求，外层动作完成后在返回前排空。内层同步调用表示“请求已排队”，最终状态按请求发生顺序最后一次为准，且不会递归调用 backend。
+- 每次 register/unregister 后均重新读取完整状态：`enabled` / `disabled` 代表目标达成，`requiresApproval` / `unavailable` 映射为对应具体错误，动作已抛错但目标已达成仍视为成功。
+- 新增测试覆盖注册后释放、释放时 Remove 失败的安全回调与单次移除、状态未变化前同目标重入、启用中重入停用、成功但最终 unavailable，以及既有 requiresApproval 路径。
+- 本轮验证：`PermissionServiceTests` 3/3、`HotkeyServiceTests` 10/10、`SystemServiceTests` 12/12；全量 `swift test -Xswiftc -warnings-as-errors` 为 96/96 通过，`git diff --check` 通过。

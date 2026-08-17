@@ -44,6 +44,9 @@ public enum LoginItemServiceError: Error, Equatable, Sendable, LocalizedError {
 @MainActor
 public final class LoginItemService: LoginItemManaging {
     private let backend: any LoginItemBacking
+    private var isMutating = false
+    private var activeDesired: Bool?
+    private var pendingDesired: Bool?
 
     public init() {
         backend = ServiceManagementLoginItemBackend()
@@ -58,34 +61,76 @@ public final class LoginItemService: LoginItemManaging {
     }
 
     public func setEnabled(_ enabled: Bool) throws {
-        let status = backend.status()
-        switch (enabled, status) {
-        case (_, .unavailable):
-            throw LoginItemServiceError.unavailable
-        case (true, .enabled), (false, .disabled):
+        if isMutating {
+            if activeDesired != enabled {
+                pendingDesired = enabled
+            }
             return
+        }
+
+        isMutating = true
+        defer {
+            isMutating = false
+            activeDesired = nil
+            pendingDesired = nil
+        }
+
+        var desired = enabled
+        while true {
+            activeDesired = desired
+            let result = performMutation(toward: desired)
+            if let pendingDesired {
+                self.pendingDesired = nil
+                desired = pendingDesired
+                continue
+            }
+            return try result.get()
+        }
+    }
+
+    private func performMutation(toward desired: Bool) -> Result<Void, LoginItemServiceError> {
+        let status = backend.status()
+        switch (desired, status) {
+        case (_, .unavailable):
+            return .failure(.unavailable)
+        case (true, .enabled), (false, .disabled):
+            return .success(())
         case (true, .requiresApproval):
-            throw LoginItemServiceError.requiresApproval
+            return .failure(.requiresApproval)
         case (true, .disabled):
-            do {
-                try backend.register()
-            } catch {
-                switch backend.status() {
-                case .enabled:
-                    return
-                case .requiresApproval:
-                    throw LoginItemServiceError.requiresApproval
-                default:
-                    throw LoginItemServiceError.registrationFailed(error.localizedDescription)
-                }
-            }
+            return runAction(desired: true) { try backend.register() }
         case (false, .enabled), (false, .requiresApproval):
-            do {
-                try backend.unregister()
-            } catch {
-                if backend.status() == .disabled { return }
-                throw LoginItemServiceError.unregistrationFailed(error.localizedDescription)
-            }
+            return runAction(desired: false) { try backend.unregister() }
+        }
+    }
+
+    private func runAction(
+        desired: Bool,
+        action: () throws -> Void
+    ) -> Result<Void, LoginItemServiceError> {
+        let actionError: Error?
+        do {
+            try action()
+            actionError = nil
+        } catch {
+            actionError = error
+        }
+
+        switch (desired, backend.status()) {
+        case (true, .enabled), (false, .disabled):
+            return .success(())
+        case (_, .requiresApproval):
+            return .failure(.requiresApproval)
+        case (_, .unavailable):
+            return .failure(.unavailable)
+        case (true, .disabled):
+            return .failure(.registrationFailed(
+                actionError?.localizedDescription ?? "系统未确认登录启动已开启。"
+            ))
+        case (false, .enabled):
+            return .failure(.unregistrationFailed(
+                actionError?.localizedDescription ?? "系统未确认登录启动已关闭。"
+            ))
         }
     }
 }

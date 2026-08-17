@@ -125,6 +125,37 @@ final class HotkeyServiceTests: XCTestCase {
 
         XCTAssertEqual(backend.registerCount, 2)
     }
+
+    func testReleasingRegisteredServiceUnregistersAndRemovesHandler() throws {
+        let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
+        weak var releasedService: HotkeyService?
+
+        do {
+            let service = HotkeyService(backend: backend)
+            try service.register(AppMetadata.defaultHotkey, handler: {})
+            releasedService = service
+        }
+
+        XCTAssertNil(releasedService)
+        XCTAssertEqual(backend.unregisterCount, 1)
+        XCTAssertEqual(backend.removeHandlerCount, 1)
+    }
+
+    func testReleasingAfterRemoveFailureDoesNotRepeatRemoveAndLeavesCallbackSafe() throws {
+        let backend = HotkeyBackendStub(registerResult: .success(HotkeyRegistration()))
+        backend.removeResults = [OSStatus(-50)]
+        var identifier: HotkeyEventID?
+
+        do {
+            let service = HotkeyService(backend: backend)
+            identifier = service.eventIdentifier
+            try service.register(AppMetadata.defaultHotkey, handler: {})
+        }
+
+        XCTAssertEqual(backend.unregisterCount, 1)
+        XCTAssertEqual(backend.removeHandlerCount, 1)
+        XCTAssertEqual(backend.fire(identifier!), OSStatus(eventNotHandledErr))
+    }
 }
 
 private final class LockedCounter: @unchecked Sendable {
@@ -144,6 +175,7 @@ private final class LockedCounter: @unchecked Sendable {
 private final class HotkeyBackendStub: HotkeyBackend {
     let registerResult: Result<HotkeyRegistration, HotkeyBackendError>
     private var eventHandlers: [UUID: @MainActor @Sendable (HotkeyEventID) -> OSStatus] = [:]
+    private var orphanedHandlers: [UUID: @MainActor @Sendable (HotkeyEventID) -> OSStatus] = [:]
     var installCount = 0
     var removeHandlerCount = 0
     var registerCount = 0
@@ -165,7 +197,9 @@ private final class HotkeyBackendStub: HotkeyBackend {
     func removeEventHandler(_ token: HotkeyHandlerToken) -> OSStatus {
         removeHandlerCount += 1
         let result = removeResults.isEmpty ? noErr : removeResults.removeFirst()
-        eventHandlers[token.identifier] = nil
+        if let handler = eventHandlers.removeValue(forKey: token.identifier), result != noErr {
+            orphanedHandlers[token.identifier] = handler
+        }
         return result
     }
 
@@ -181,10 +215,16 @@ private final class HotkeyBackendStub: HotkeyBackend {
     }
 
     func fire(_ identifier: HotkeyEventID) -> OSStatus {
-        for eventHandler in eventHandlers.values {
+        for eventHandler in eventHandlers.values.chain(orphanedHandlers.values) {
             let result = eventHandler(identifier)
             if result == noErr { return noErr }
         }
         return OSStatus(eventNotHandledErr)
+    }
+}
+
+private extension Collection {
+    func chain<C: Collection>(_ other: C) -> [Element] where C.Element == Element {
+        Array(self) + Array(other)
     }
 }
