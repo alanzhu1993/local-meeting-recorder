@@ -37,62 +37,25 @@ private struct DualCaptureArguments {
     }
 }
 
-private struct SourceMetrics: Sendable {
-    var sampleCount = 0
-    var presentationTimesAreStrictlyIncreasing = true
-    var lastPresentationTime: CMTime?
-
-    mutating func record(_ presentationTime: CMTime) {
-        if let lastPresentationTime,
-           CMTimeCompare(presentationTime, lastPresentationTime) <= 0 {
-            presentationTimesAreStrictlyIncreasing = false
-        }
-        sampleCount += 1
-        lastPresentationTime = presentationTime
-    }
-}
-
-private struct ProbeSnapshot: Sendable {
-    let system: SourceMetrics
-    let microphone: SourceMetrics
-    let microphoneChanges: [String]
-    let warnings: [RecordingFailure]
-    let stoppedFailure: RecordingFailure?
-}
-
 private actor ProbeMetrics {
-    private var system = SourceMetrics()
-    private var microphone = SourceMetrics()
-    private var microphoneChanges: [String] = []
-    private var warnings: [RecordingFailure] = []
-    private var stoppedFailure: RecordingFailure?
+    private var metrics = AudioCaptureProbeMetrics()
+    private let stopped = AsyncStream<Void>.makeStream()
 
     func consume(_ event: AudioCaptureEvent) {
-        switch event {
-        case let .sample(sample):
-            switch sample.source {
-            case .system:
-                system.record(sample.presentationTime)
-            case .microphone:
-                microphone.record(sample.presentationTime)
-            }
-        case let .microphoneChanged(identifier):
-            microphoneChanges.append(identifier)
-        case let .warning(failure):
-            warnings.append(failure)
-        case let .stopped(failure):
-            stoppedFailure = failure
+        metrics.consume(event)
+        if case .stopped = event {
+            stopped.continuation.yield()
         }
     }
 
-    func snapshot() -> ProbeSnapshot {
-        ProbeSnapshot(
-            system: system,
-            microphone: microphone,
-            microphoneChanges: microphoneChanges,
-            warnings: warnings,
-            stoppedFailure: stoppedFailure
-        )
+    func waitForStoppedEvent() async {
+        if metrics.snapshot.stoppedEventCount > 0 { return }
+        var iterator = stopped.stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
+
+    func snapshot() -> AudioCaptureProbeSnapshot {
+        metrics.snapshot
     }
 }
 
@@ -104,16 +67,12 @@ private struct ProbeResult {
     let screenPermissionAfter: Bool
     let microphoneAuthorizationBefore: AVAuthorizationStatus
     let microphoneAuthorizationAfter: AVAuthorizationStatus
-    let snapshot: ProbeSnapshot
+    let snapshot: AudioCaptureProbeSnapshot
     let startFailure: RecordingFailure?
 
     var passed: Bool {
         startFailure == nil
-            && snapshot.stoppedFailure == nil
-            && snapshot.system.sampleCount > 0
-            && snapshot.microphone.sampleCount > 0
-            && snapshot.system.presentationTimesAreStrictlyIncreasing
-            && snapshot.microphone.presentationTimesAreStrictlyIncreasing
+            && snapshot.passedCaptureChecks
     }
 }
 
@@ -138,6 +97,7 @@ private func runDualCapture(_ arguments: DualCaptureArguments) async -> ProbeRes
         }
         try await Task.sleep(for: .seconds(arguments.seconds))
         await engine.stop()
+        await metrics.waitForStoppedEvent()
     } catch {
         startFailure = recordingFailure(from: error)
         await engine.stop()
@@ -194,7 +154,7 @@ private func reportText(for result: ProbeResult, command: String) -> String {
     ## 结论
 
     - 真实双音源 probe：**\(status)**
-    - 判定标准：系统音频和麦克风样本数都大于 0；两路 PTS 都严格递增；未注册或保存屏幕视频帧。
+    - 判定标准：系统音频和麦克风样本数都大于 0；两路 PTS 均有效、为有限数值且严格递增；恰好收到 1 个无错误的 stopped 事件；未注册或保存屏幕视频帧。
     - 这次 probe 没有注册 `.screen` output，也没有创建任何视频文件。
 
     ## 运行环境
@@ -213,11 +173,14 @@ private func reportText(for result: ProbeResult, command: String) -> String {
 
     - 系统音频样本数：\(result.snapshot.system.sampleCount)
     - 麦克风样本数：\(result.snapshot.microphone.sampleCount)
+    - 系统音频无效 PTS 数：\(result.snapshot.system.invalidPresentationTimeCount)
+    - 麦克风无效 PTS 数：\(result.snapshot.microphone.invalidPresentationTimeCount)
     - 系统音频 PTS 严格递增：\(result.snapshot.system.presentationTimesAreStrictlyIncreasing)
     - 麦克风 PTS 严格递增：\(result.snapshot.microphone.presentationTimesAreStrictlyIncreasing)
     - 视频样本数：0（未注册 `.screen` output）
     - 默认麦克风变更事件：\(microphoneChanges)
     - warning：\(warnings)
+    - stopped 事件数：\(result.snapshot.stoppedEventCount)
     - 启动失败：\(failure)
     - 采集中止失败：\(stoppedFailure)
 
@@ -264,8 +227,11 @@ if arguments.first == "dual-capture" {
 
     print("systemSamples=\(result.snapshot.system.sampleCount)")
     print("microphoneSamples=\(result.snapshot.microphone.sampleCount)")
+    print("systemInvalidPTS=\(result.snapshot.system.invalidPresentationTimeCount)")
+    print("microphoneInvalidPTS=\(result.snapshot.microphone.invalidPresentationTimeCount)")
     print("systemPTSMonotonic=\(result.snapshot.system.presentationTimesAreStrictlyIncreasing)")
     print("microphonePTSMonotonic=\(result.snapshot.microphone.presentationTimesAreStrictlyIncreasing)")
+    print("stoppedEvents=\(result.snapshot.stoppedEventCount)")
     print("screenSamples=0")
     print("result=\(result.passed ? "PASS" : "NOT_PASSED")")
     exit(result.passed ? 0 : 2)

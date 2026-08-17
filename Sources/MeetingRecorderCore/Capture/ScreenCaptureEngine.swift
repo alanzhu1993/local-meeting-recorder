@@ -5,13 +5,36 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
-public actor ScreenCaptureEngine: AudioCapturing {
-    private var stream: SCStream?
-    private var outputBridge: StreamOutputBridge?
-    private var eventDeliveryTask: Task<Void, Never>?
-    private var defaultInputListener: DefaultInputDeviceListener?
+protocol ScreenCaptureBackend: Sendable {
+    func start() async throws
+    func stop() async -> RecordingFailure?
+    func updateDefaultMicrophone() async throws
+}
 
-    public init() {}
+typealias ScreenCaptureBackendFactory = @Sendable (
+    @escaping @Sendable (AudioCaptureEvent) async -> Void
+) -> any ScreenCaptureBackend
+
+public actor ScreenCaptureEngine: AudioCapturing {
+    private enum Lifecycle {
+        case idle
+        case starting(CaptureLifecycleSession)
+        case running(CaptureLifecycleSession)
+        case stopping(CaptureLifecycleSession)
+    }
+
+    private let backendFactory: ScreenCaptureBackendFactory
+    private var lifecycle: Lifecycle = .idle
+
+    public init() {
+        backendFactory = { eventHandler in
+            ScreenCaptureKitBackend(eventHandler: eventHandler)
+        }
+    }
+
+    init(backendFactory: @escaping ScreenCaptureBackendFactory) {
+        self.backendFactory = backendFactory
+    }
 
     public static func makeConfiguration(
         microphoneDeviceID: String?
@@ -47,13 +70,254 @@ public actor ScreenCaptureEngine: AudioCapturing {
     public func start(
         eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void
     ) async throws {
-        guard stream == nil else {
+        guard case .idle = lifecycle else {
             throw RecordingFailure(
                 code: .capture,
-                message: "Audio capture is already running."
+                message: "Audio capture is already starting, running, or stopping."
             )
         }
 
+        let identifier = UUID()
+        let delivery = AudioCaptureEventDelivery(eventHandler: eventHandler)
+        let backend = backendFactory { [weak self] event in
+            await self?.receive(event, from: identifier)
+        }
+        let session = CaptureLifecycleSession(
+            identifier: identifier,
+            backend: backend,
+            delivery: delivery
+        )
+        lifecycle = .starting(session)
+
+        do {
+            try await session.startTask.value
+        } catch {
+            let failure = Self.failure(from: error, fallbackCode: .capture)
+            if owns(session, in: lifecycle, phase: .starting) {
+                lifecycle = .stopping(session)
+                let cleanup = beginStopping(session)
+                _ = await cleanup.value
+                if owns(session, in: lifecycle, phase: .stopping) {
+                    lifecycle = .idle
+                    session.delivery.finish()
+                }
+            }
+            throw failure
+        }
+
+        guard owns(session, in: lifecycle, phase: .starting) else {
+            throw RecordingFailure(
+                code: .capture,
+                message: "Audio capture start was cancelled before it became active."
+            )
+        }
+        lifecycle = .running(session)
+    }
+
+    public func stop() async {
+        let session: CaptureLifecycleSession
+        switch lifecycle {
+        case .idle:
+            return
+        case let .starting(current), let .running(current):
+            session = current
+            lifecycle = .stopping(current)
+        case let .stopping(current):
+            session = current
+        }
+
+        let stopTask = beginStopping(session)
+        let stopFailure = await stopTask.value
+        completeStop(of: session, stopFailure: stopFailure)
+    }
+
+    public func updateDefaultMicrophone() async throws {
+        guard case let .running(session) = lifecycle else {
+            throw RecordingFailure(
+                code: .microphone,
+                message: "Cannot update the microphone while capture is not running."
+            )
+        }
+
+        try await session.backend.updateDefaultMicrophone()
+        guard owns(session, in: lifecycle, phase: .running) else {
+            throw RecordingFailure(
+                code: .microphone,
+                message: "Capture stopped while the microphone was being updated."
+            )
+        }
+    }
+
+    private func receive(_ event: AudioCaptureEvent, from identifier: UUID) async {
+        guard let session = currentSession(with: identifier) else { return }
+
+        switch event {
+        case let .stopped(failure):
+            if session.terminalFailure == nil, let failure {
+                session.terminalFailure = failure
+            }
+            switch lifecycle {
+            case .starting, .running:
+                lifecycle = .stopping(session)
+            case .stopping:
+                break
+            case .idle:
+                return
+            }
+
+            let stopTask = beginStopping(session)
+            Task { [weak self] in
+                let stopFailure = await stopTask.value
+                await self?.completeStop(
+                    of: session,
+                    stopFailure: stopFailure
+                )
+            }
+        default:
+            guard
+                owns(session, in: lifecycle, phase: .starting)
+                    || owns(session, in: lifecycle, phase: .running)
+            else {
+                return
+            }
+            session.delivery.emit(event)
+        }
+    }
+
+    private func beginStopping(
+        _ session: CaptureLifecycleSession
+    ) -> Task<RecordingFailure?, Never> {
+        if let stopTask = session.stopTask {
+            return stopTask
+        }
+
+        session.startTask.cancel()
+        let startTask = session.startTask
+        let backend = session.backend
+        let stopTask = Task {
+            _ = await startTask.result
+            return await backend.stop()
+        }
+        session.stopTask = stopTask
+        return stopTask
+    }
+
+    private func completeStop(
+        of session: CaptureLifecycleSession,
+        stopFailure: RecordingFailure?
+    ) {
+        guard owns(session, in: lifecycle, phase: .stopping) else { return }
+        lifecycle = .idle
+        guard !session.didSendStoppedEvent else { return }
+
+        session.didSendStoppedEvent = true
+        session.delivery.emit(.stopped(session.terminalFailure ?? stopFailure))
+        session.delivery.finish()
+    }
+
+    private enum LifecyclePhase {
+        case starting
+        case running
+        case stopping
+    }
+
+    private func owns(
+        _ session: CaptureLifecycleSession,
+        in lifecycle: Lifecycle,
+        phase: LifecyclePhase
+    ) -> Bool {
+        switch (lifecycle, phase) {
+        case let (.starting(current), .starting),
+             let (.running(current), .running),
+             let (.stopping(current), .stopping):
+            return current.identifier == session.identifier
+        default:
+            return false
+        }
+    }
+
+    private func currentSession(with identifier: UUID) -> CaptureLifecycleSession? {
+        let session: CaptureLifecycleSession
+        switch lifecycle {
+        case .idle:
+            return nil
+        case let .starting(current), let .running(current), let .stopping(current):
+            session = current
+        }
+        return session.identifier == identifier ? session : nil
+    }
+
+    fileprivate static func failure(
+        from error: Error,
+        fallbackCode: RecordingFailure.Code
+    ) -> RecordingFailure {
+        if let failure = error as? RecordingFailure {
+            return failure
+        }
+        return RecordingFailure(
+            code: fallbackCode,
+            message: error.localizedDescription
+        )
+    }
+}
+
+private final class CaptureLifecycleSession: @unchecked Sendable {
+    let identifier: UUID
+    let backend: any ScreenCaptureBackend
+    let delivery: AudioCaptureEventDelivery
+    let startTask: Task<Void, any Error>
+    var stopTask: Task<RecordingFailure?, Never>?
+    var terminalFailure: RecordingFailure?
+    var didSendStoppedEvent = false
+
+    init(
+        identifier: UUID,
+        backend: any ScreenCaptureBackend,
+        delivery: AudioCaptureEventDelivery
+    ) {
+        self.identifier = identifier
+        self.backend = backend
+        self.delivery = delivery
+        startTask = Task {
+            try await backend.start()
+        }
+    }
+}
+
+private final class AudioCaptureEventDelivery: @unchecked Sendable {
+    private let continuation: AsyncStream<AudioCaptureEvent>.Continuation
+    private let deliveryTask: Task<Void, Never>
+
+    init(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) {
+        let events = AsyncStream<AudioCaptureEvent>.makeStream()
+        continuation = events.continuation
+        deliveryTask = Task {
+            for await event in events.stream {
+                await eventHandler(event)
+            }
+        }
+    }
+
+    func emit(_ event: AudioCaptureEvent) {
+        continuation.yield(event)
+    }
+
+    func finish() {
+        continuation.finish()
+    }
+}
+
+private actor ScreenCaptureKitBackend: ScreenCaptureBackend {
+    private let eventRelay: BackendEventRelay
+    private var stream: SCStream?
+    private var outputBridge: StreamOutputBridge?
+    private var defaultInputListener: DefaultInputDeviceListener?
+
+    init(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) {
+        eventRelay = BackendEventRelay(eventHandler: eventHandler)
+    }
+
+    func start() async throws {
         let microphoneDeviceID = try Self.defaultMicrophoneDeviceID()
         let content: SCShareableContent
         do {
@@ -65,8 +329,9 @@ public actor ScreenCaptureEngine: AudioCapturing {
             let code: RecordingFailure.Code = CGPreflightScreenCaptureAccess()
                 ? .capture
                 : .permission
-            throw Self.failure(from: error, fallbackCode: code)
+            throw ScreenCaptureEngine.failure(from: error, fallbackCode: code)
         }
+        try Task.checkCancellation()
 
         guard let display = content.displays.first(where: {
             $0.displayID == CGMainDisplayID()
@@ -86,12 +351,10 @@ public actor ScreenCaptureEngine: AudioCapturing {
             excludingApplications: currentApplication,
             exceptingWindows: []
         )
-        let configuration = Self.makeConfiguration(
+        let configuration = ScreenCaptureEngine.makeConfiguration(
             microphoneDeviceID: microphoneDeviceID
         )
-
-        let events = AsyncStream<AudioCaptureEvent>.makeStream()
-        let bridge = StreamOutputBridge(continuation: events.continuation)
+        let bridge = StreamOutputBridge(eventRelay: eventRelay)
         let stream = SCStream(
             filter: filter,
             configuration: configuration,
@@ -109,25 +372,16 @@ public actor ScreenCaptureEngine: AudioCapturing {
                 type: .microphone,
                 sampleHandlerQueue: bridge.microphoneQueue
             )
-        } catch {
-            events.continuation.finish()
-            throw Self.failure(from: error, fallbackCode: .capture)
-        }
-
-        self.outputBridge = bridge
-        self.stream = stream
-        eventDeliveryTask = Task {
-            for await event in events.stream {
-                await eventHandler(event)
-            }
-        }
-
-        do {
+            self.outputBridge = bridge
+            self.stream = stream
+            try Task.checkCancellation()
             try await stream.startCapture()
+            try Task.checkCancellation()
         } catch {
-            let failure = Self.failure(from: error, fallbackCode: .capture)
-            await discardCurrentStream()
-            throw failure
+            self.outputBridge = bridge
+            self.stream = stream
+            _ = await stop()
+            throw ScreenCaptureEngine.failure(from: error, fallbackCode: .capture)
         }
 
         do {
@@ -137,39 +391,39 @@ public actor ScreenCaptureEngine: AudioCapturing {
                 }
             }
         } catch {
-            outputBridge?.emit(.warning(Self.failure(
+            eventRelay.emit(.warning(ScreenCaptureEngine.failure(
                 from: error,
                 fallbackCode: .microphone
             )))
         }
     }
 
-    public func stop() async {
-        guard let stream else { return }
-
+    func stop() async -> RecordingFailure? {
         defaultInputListener?.invalidate()
         defaultInputListener = nil
 
         let failure: RecordingFailure?
-        do {
-            try await stream.stopCapture()
+        if let stream {
+            do {
+                try await stream.stopCapture()
+                failure = nil
+            } catch {
+                failure = ScreenCaptureEngine.failure(
+                    from: error,
+                    fallbackCode: .capture
+                )
+            }
+        } else {
             failure = nil
-        } catch {
-            failure = Self.failure(from: error, fallbackCode: .capture)
         }
 
-        outputBridge?.emit(.stopped(failure))
-        outputBridge?.finish()
-        self.stream = nil
+        stream = nil
         outputBridge = nil
-
-        if let eventDeliveryTask {
-            await eventDeliveryTask.value
-        }
-        self.eventDeliveryTask = nil
+        await eventRelay.finish()
+        return failure
     }
 
-    public func updateDefaultMicrophone() async throws {
+    func updateDefaultMicrophone() async throws {
         guard let stream else {
             throw RecordingFailure(
                 code: .microphone,
@@ -178,14 +432,14 @@ public actor ScreenCaptureEngine: AudioCapturing {
         }
 
         let microphoneDeviceID = try Self.defaultMicrophoneDeviceID()
-        let configuration = Self.makeConfiguration(
+        let configuration = ScreenCaptureEngine.makeConfiguration(
             microphoneDeviceID: microphoneDeviceID
         )
         do {
             try await stream.updateConfiguration(configuration)
-            outputBridge?.emit(.microphoneChanged(microphoneDeviceID))
+            eventRelay.emit(.microphoneChanged(microphoneDeviceID))
         } catch {
-            throw Self.failure(from: error, fallbackCode: .microphone)
+            throw ScreenCaptureEngine.failure(from: error, fallbackCode: .microphone)
         }
     }
 
@@ -193,24 +447,11 @@ public actor ScreenCaptureEngine: AudioCapturing {
         do {
             try await updateDefaultMicrophone()
         } catch {
-            let failure = Self.failure(from: error, fallbackCode: .microphone)
-            outputBridge?.emit(.warning(failure))
+            eventRelay.emit(.warning(ScreenCaptureEngine.failure(
+                from: error,
+                fallbackCode: .microphone
+            )))
         }
-    }
-
-    private func discardCurrentStream() async {
-        defaultInputListener?.invalidate()
-        defaultInputListener = nil
-        if let stream {
-            try? await stream.stopCapture()
-        }
-        outputBridge?.finish()
-        stream = nil
-        outputBridge = nil
-        if let eventDeliveryTask {
-            await eventDeliveryTask.value
-        }
-        self.eventDeliveryTask = nil
     }
 
     private static func defaultMicrophoneDeviceID() throws -> String {
@@ -222,18 +463,29 @@ public actor ScreenCaptureEngine: AudioCapturing {
         }
         return identifier
     }
+}
 
-    private static func failure(
-        from error: Error,
-        fallbackCode: RecordingFailure.Code
-    ) -> RecordingFailure {
-        if let failure = error as? RecordingFailure {
-            return failure
+private final class BackendEventRelay: @unchecked Sendable {
+    private let continuation: AsyncStream<AudioCaptureEvent>.Continuation
+    private let deliveryTask: Task<Void, Never>
+
+    init(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) {
+        let events = AsyncStream<AudioCaptureEvent>.makeStream()
+        continuation = events.continuation
+        deliveryTask = Task {
+            for await event in events.stream {
+                await eventHandler(event)
+            }
         }
-        return RecordingFailure(
-            code: fallbackCode,
-            message: error.localizedDescription
-        )
+    }
+
+    func emit(_ event: AudioCaptureEvent) {
+        continuation.yield(event)
+    }
+
+    func finish() async {
+        continuation.finish()
+        await deliveryTask.value
     }
 }
 
@@ -247,18 +499,10 @@ private final class StreamOutputBridge: NSObject, SCStreamOutput, SCStreamDelega
         label: "com.coohom.meeting-recorder.capture.microphone"
     )
 
-    private let continuation: AsyncStream<AudioCaptureEvent>.Continuation
+    private let eventRelay: BackendEventRelay
 
-    init(continuation: AsyncStream<AudioCaptureEvent>.Continuation) {
-        self.continuation = continuation
-    }
-
-    func emit(_ event: AudioCaptureEvent) {
-        continuation.yield(event)
-    }
-
-    func finish() {
-        continuation.finish()
+    init(eventRelay: BackendEventRelay) {
+        self.eventRelay = eventRelay
     }
 
     func stream(
@@ -275,7 +519,7 @@ private final class StreamOutputBridge: NSObject, SCStreamOutput, SCStreamDelega
             return
         }
 
-        emit(.sample(CapturedAudioSample(
+        eventRelay.emit(.sample(CapturedAudioSample(
             source: source,
             buffer: sampleBuffer,
             presentationTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -283,7 +527,7 @@ private final class StreamOutputBridge: NSObject, SCStreamOutput, SCStreamDelega
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        emit(.stopped(RecordingFailure(
+        eventRelay.emit(.stopped(RecordingFailure(
             code: .capture,
             message: error.localizedDescription
         )))
