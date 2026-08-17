@@ -5,6 +5,25 @@ import XCTest
 @testable import MeetingRecorderCore
 
 final class LiveRecordingSessionManagerTests: XCTestCase {
+    func testStaleActivityLeaseCannotReleaseCurrentOwner() async throws {
+        let activityGate = RecordingActivityGate()
+        let staleLease = try await activityGate.acquireRecording()
+        await activityGate.release(staleLease)
+        let recoveryLease = try await activityGate.acquireRecovery()
+
+        await activityGate.release(staleLease)
+        do {
+            _ = try await activityGate.acquireRecording()
+            XCTFail("Expected the recovery owner to retain the gate.")
+        } catch let failure as RecordingFailure {
+            XCTAssertTrue(failure.message.contains("恢复"))
+        }
+
+        await activityGate.release(recoveryLease)
+        let nextLease = try await activityGate.acquireRecording()
+        await activityGate.release(nextLease)
+    }
+
     func testStartRollsBackInReverseOrderWhenCaptureFailsAndReleasesReservationOnce() async throws {
         let harness = try SessionHarness(captureStartError: SessionTestError.capture)
 
@@ -64,20 +83,79 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
         XCTAssertEqual(writerStartCallCount, 0)
     }
 
-    func testRecoveryInProgressRejectsStartBeforeCheckingPermissionsOrStorage() async throws {
-        let harness = try SessionHarness(recoveryInProgress: true)
+    func testRecordingLeaseAcquiredBeforePermissionPreventsRecoveryScan() async throws {
+        let activityGate = RecordingActivityGate()
+        let permissionGate = SessionAsyncGate()
+        let harness = try SessionHarness(
+            permissionGate: permissionGate,
+            activityGate: activityGate
+        )
+        let recoveryStore = SessionRecoveryStoreSpy(interrupted: [harness.paths.workingURL])
+        let recovery = RecoveryService(
+            activityGate: activityGate,
+            store: recoveryStore,
+            finalizer: SessionRecoveryFinalizerSpy()
+        )
 
+        let start = Task { try await harness.manager.start(at: harness.startDate) }
+        await harness.permissions.waitUntilStatusEntered()
+        let recoveryResults = await recovery.recoverInterruptedRecordings()
+
+        XCTAssertTrue(recoveryResults.isEmpty)
+        let listCallCount = await recoveryStore.listCallCount
+        let recoveryFailure = await recovery.lastFailure
+        XCTAssertEqual(listCallCount, 0)
+        XCTAssertNotNil(recoveryFailure)
+        await permissionGate.open()
+        _ = try await start.value
+        _ = try await harness.manager.stop()
+    }
+
+    func testRecoveryLeaseAcquiredBeforeScanPreventsStartBeforePrepare() async throws {
+        let activityGate = RecordingActivityGate()
+        let recoveryGate = SessionAsyncGate()
+        let harness = try SessionHarness(activityGate: activityGate)
+        let recoveryStore = SessionRecoveryStoreSpy(interrupted: [harness.paths.workingURL])
+        let finalizer = SessionRecoveryFinalizerSpy(gate: recoveryGate)
+        let recovery = RecoveryService(
+            activityGate: activityGate,
+            store: recoveryStore,
+            finalizer: finalizer
+        )
+
+        let recoveryTask = Task { await recovery.recoverInterruptedRecordings() }
+        await finalizer.waitUntilEntered()
         do {
             _ = try await harness.manager.start(at: harness.startDate)
-            XCTFail("Expected recovery coordination failure.")
+            XCTFail("Expected recording activity conflict.")
         } catch let failure as RecordingFailure {
-            XCTAssertTrue(failure.message.contains("正在恢复"))
+            XCTAssertTrue(failure.message.contains("恢复"))
         }
 
         let prepareCallCount = await harness.store.prepareCallCount
         XCTAssertEqual(prepareCallCount, 0)
-        XCTAssertEqual(harness.sleep.beginCallCount, 0)
-        XCTAssertEqual(harness.calls.values.first, "notification.failed")
+        await recoveryGate.open()
+        _ = await recoveryTask.value
+    }
+
+    func testActiveRecordingWorkingFileCannotBeScannedForRecovery() async throws {
+        let activityGate = RecordingActivityGate()
+        let harness = try SessionHarness(activityGate: activityGate)
+        let recoveryStore = SessionRecoveryStoreSpy(interrupted: [harness.paths.workingURL])
+        let recovery = RecoveryService(
+            activityGate: activityGate,
+            store: recoveryStore,
+            finalizer: SessionRecoveryFinalizerSpy()
+        )
+        _ = try await harness.manager.start(at: harness.startDate)
+
+        let results = await recovery.recoverInterruptedRecordings()
+
+        XCTAssertTrue(results.isEmpty)
+        let listCallCount = await recoveryStore.listCallCount
+        XCTAssertEqual(listCallCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.paths.workingURL.path))
+        _ = try await harness.manager.stop()
     }
 
     func testConcurrentStopDuringStartingInterruptsAndCleansUpExactlyOnce() async throws {
@@ -126,6 +204,28 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
         let savedCallCount = await harness.notifications.savedCallCount
         XCTAssertEqual(finalAppendCallCount, 1)
         XCTAssertEqual(savedCallCount, 1)
+    }
+
+    func testFinishFailureAbortsOnceRetainsWorkingFileAndEndsSleep() async throws {
+        let finishFailure = RecordingFailure(code: .finalize, message: "finish failed")
+        let harness = try SessionHarness(writerFinishError: finishFailure)
+        _ = try await harness.manager.start(at: harness.startDate)
+
+        do {
+            _ = try await harness.manager.stop()
+            XCTFail("Expected finish to fail.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure, finishFailure)
+        }
+
+        let abortCallCount = await harness.writer.abortCallCount
+        XCTAssertEqual(abortCallCount, 1)
+        XCTAssertEqual(harness.sleep.endCallCount, 1)
+        XCTAssertEqual(
+            try Data(contentsOf: harness.paths.workingURL),
+            Data("working-marker".utf8)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.paths.finalURL.path))
     }
 
     func testMicrophoneWarningAndChangeContinueRecording() async throws {
@@ -191,9 +291,9 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
         _ = try await harness.manager.start(at: harness.startDate)
 
         await harness.capture.emit(try harness.sampleEvent(source: .system, amplitude: 0.5))
+        let failures = await recorder.waitForFailureCount(1)
         await harness.capture.emit(.stopped(RecordingFailure(code: .capture, message: "stream stopped")))
         await harness.capture.emit(.stopped(nil))
-        let failures = await recorder.waitForFailureCount(1)
         await harness.waitUntilIdleCleanup()
 
         XCTAssertEqual(failures, [appendFailure])
@@ -250,6 +350,38 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
         await recorder.cancel()
     }
 
+    func testFatalCaptureEventCannotBeDroppedWhenSampleQueueIsSaturated() async throws {
+        let appendGate = SessionAsyncGate()
+        let harness = try SessionHarness(writerAppendGate: appendGate, sampleQueueCapacity: 3)
+        let events = await harness.manager.events()
+        let recorder = SessionEventRecorder(events: events)
+        _ = try await harness.manager.start(at: harness.startDate)
+
+        await harness.capture.emit(try harness.sampleEvent(source: .system, amplitude: 0.5))
+        await harness.writer.waitUntilAppendEntered()
+        for _ in 0..<20 {
+            await harness.capture.emit(try harness.sampleEvent(source: .system, amplitude: 0.5))
+        }
+        let fatal = RecordingFailure(code: .capture, message: "stream failed under load")
+        await harness.capture.emit(.stopped(fatal))
+        for _ in 0..<20 {
+            await harness.capture.emit(try harness.sampleEvent(source: .system, amplitude: 0.5))
+        }
+
+        await appendGate.open()
+        let failures = await recorder.waitForFailureCount(1)
+        await harness.waitUntilIdleCleanup()
+        XCTAssertEqual(failures, [fatal])
+        let stopCallCount = await harness.capture.stopCallCount
+        let abortCallCount = await harness.writer.abortCallCount
+        let failedCallCount = await harness.notifications.failedCallCount
+        XCTAssertEqual(stopCallCount, 1)
+        XCTAssertEqual(abortCallCount, 1)
+        XCTAssertEqual(failedCallCount, 1)
+        XCTAssertEqual(harness.sleep.endCallCount, 1)
+        await recorder.cancel()
+    }
+
     func testRealConverterMixerAndFragmentedWriterCommitPlayableM4A() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -266,6 +398,7 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
         )
         let startedAt = Date(timeIntervalSince1970: 1_777_777_777)
         let manager = LiveRecordingSessionManager(
+            activityGate: RecordingActivityGate(),
             store: store,
             capture: capture,
             permissions: permissions,
@@ -277,8 +410,7 @@ final class LiveRecordingSessionManagerTests: XCTestCase {
                 AudioTimelineMixer(sampleRate: 48_000, channels: 2, chunkFrames: 960)
             },
             now: { startedAt.addingTimeInterval(1) },
-            sampleQueueCapacity: 64,
-            recoveryInProgress: { false }
+            sampleQueueCapacity: 64
         )
         _ = try await manager.start(at: startedAt)
 
@@ -345,9 +477,11 @@ private final class SessionHarness: @unchecked Sendable {
         captureStartGate: SessionAsyncGate? = nil,
         writerStartError: Error? = nil,
         writerAppendError: RecordingFailure? = nil,
+        writerFinishError: RecordingFailure? = nil,
         writerAppendGate: SessionAsyncGate? = nil,
         sampleQueueCapacity: Int = 16,
-        recoveryInProgress: Bool = false
+        permissionGate: SessionAsyncGate? = nil,
+        activityGate: RecordingActivityGate = RecordingActivityGate()
     ) throws {
         let callLog = SessionCallLog()
         calls = callLog
@@ -363,12 +497,17 @@ private final class SessionHarness: @unchecked Sendable {
             recoveredURL: directory.appendingPathComponent("meeting-recovered.m4a")
         )
         store = SessionStoreSpy(paths: paths, calls: callLog)
-        permissions = SessionPermissionSpy(granted: permissionGranted, calls: callLog)
+        permissions = SessionPermissionSpy(
+            granted: permissionGranted,
+            gate: permissionGate,
+            calls: callLog
+        )
         capture = SessionCaptureSpy(startError: captureStartError, startGate: captureStartGate, calls: callLog)
         writer = SessionWriterSpy(
             workingURL: paths.workingURL,
             startError: writerStartError,
             appendError: writerAppendError,
+            finishError: writerFinishError,
             appendGate: writerAppendGate,
             calls: callLog
         )
@@ -376,6 +515,7 @@ private final class SessionHarness: @unchecked Sendable {
         notifications = SessionNotificationSpy(calls: callLog)
         converter = SessionConverterSpy()
         manager = LiveRecordingSessionManager(
+            activityGate: activityGate,
             store: store,
             capture: capture,
             permissions: permissions,
@@ -385,8 +525,7 @@ private final class SessionHarness: @unchecked Sendable {
             converterFactory: { [converter] in converter },
             mixerFactory: { SessionMixerSpy(calls: callLog) },
             now: { Date(timeIntervalSince1970: 1_777_777_807) },
-            sampleQueueCapacity: sampleQueueCapacity,
-            recoveryInProgress: { recoveryInProgress }
+            sampleQueueCapacity: sampleQueueCapacity
         )
     }
 
@@ -452,20 +591,30 @@ private actor SessionStoreSpy: RecordingSessionStoring {
 
 private actor SessionPermissionSpy: PermissionChecking {
     let granted: Bool
+    let gate: SessionAsyncGate?
     let calls: SessionCallLog
+    private let statusEntered = AsyncStream<Void>.makeStream()
 
-    init(granted: Bool, calls: SessionCallLog) {
+    init(granted: Bool, gate: SessionAsyncGate? = nil, calls: SessionCallLog) {
         self.granted = granted
+        self.gate = gate
         self.calls = calls
     }
 
     func currentStatus() async -> CapturePermissionStatus {
         calls.append("permission.status")
+        statusEntered.continuation.yield()
+        await gate?.wait()
         return CapturePermissionStatus(missing: granted ? [] : [.systemAudio])
     }
 
     func requestMissingPermissions() async -> CapturePermissionStatus {
         await currentStatus()
+    }
+
+    func waitUntilStatusEntered() async {
+        var iterator = statusEntered.stream.makeAsyncIterator()
+        _ = await iterator.next()
     }
 }
 
@@ -528,6 +677,7 @@ private actor SessionWriterSpy: RecoverableAudioWriting {
     private let workingURL: URL
     private let startError: Error?
     private let appendError: RecordingFailure?
+    private let finishError: RecordingFailure?
     private let appendGate: SessionAsyncGate?
     private let calls: SessionCallLog
     private let appendEntered = AsyncStream<Void>.makeStream()
@@ -540,12 +690,14 @@ private actor SessionWriterSpy: RecoverableAudioWriting {
         workingURL: URL,
         startError: Error?,
         appendError: RecordingFailure?,
+        finishError: RecordingFailure?,
         appendGate: SessionAsyncGate?,
         calls: SessionCallLog
     ) {
         self.workingURL = workingURL
         self.startError = startError
         self.appendError = appendError
+        self.finishError = finishError
         self.appendGate = appendGate
         self.calls = calls
     }
@@ -554,7 +706,10 @@ private actor SessionWriterSpy: RecoverableAudioWriting {
         startCallCount += 1
         calls.append("writer.start")
         if let startError { throw startError }
-        FileManager.default.createFile(atPath: workingURL.path, contents: Data())
+        FileManager.default.createFile(
+            atPath: workingURL.path,
+            contents: Data("working-marker".utf8)
+        )
     }
 
     func append(_ chunk: MixedAudioChunk) async throws {
@@ -570,6 +725,7 @@ private actor SessionWriterSpy: RecoverableAudioWriting {
 
     func finish(finalURL: URL) async throws -> URL {
         calls.append("writer.finish")
+        if let finishError { throw finishError }
         FileManager.default.createFile(atPath: finalURL.path, contents: Data())
         try? FileManager.default.removeItem(at: workingURL)
         return finalURL
@@ -754,6 +910,46 @@ private actor SessionEventStorage {
     func waitForFailureCount(_ count: Int) async -> [RecordingFailure] {
         while failures.count < count { await Task.yield() }
         return failures
+    }
+}
+
+private actor SessionRecoveryStoreSpy: InterruptedRecordingStoring {
+    private let interrupted: [URL]
+    private(set) var listCallCount = 0
+
+    init(interrupted: [URL]) {
+        self.interrupted = interrupted
+    }
+
+    func listInterruptedRecordings() async throws -> [URL] {
+        listCallCount += 1
+        return interrupted
+    }
+
+    func recoveredURL(for workingURL: URL) async throws -> URL {
+        workingURL.deletingPathExtension().appendingPathExtension("m4a")
+    }
+
+    func releaseReservation(for outputURL: URL) async {}
+}
+
+private actor SessionRecoveryFinalizerSpy: InterruptedRecordingFinalizing {
+    private let gate: SessionAsyncGate?
+    private let entered = AsyncStream<Void>.makeStream()
+
+    init(gate: SessionAsyncGate? = nil) {
+        self.gate = gate
+    }
+
+    func recover(workingURL: URL, recoveredURL: URL) async throws -> URL {
+        entered.continuation.yield()
+        await gate?.wait()
+        return recoveredURL
+    }
+
+    func waitUntilEntered() async {
+        var iterator = entered.stream.makeAsyncIterator()
+        _ = await iterator.next()
     }
 }
 

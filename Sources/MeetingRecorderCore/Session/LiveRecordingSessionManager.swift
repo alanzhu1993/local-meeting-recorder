@@ -30,6 +30,65 @@ typealias SessionWriterFactory = @Sendable (URL) throws -> any RecoverableAudioW
 typealias SessionConverterFactory = @Sendable () -> any AudioSampleConverting
 typealias SessionMixerFactory = @Sendable () -> any AudioMixing
 
+public actor RecordingActivityGate {
+    enum Kind: Sendable {
+        case recording
+        case recovering
+    }
+
+    struct Lease: Sendable {
+        let identifier: UUID
+        let kind: Kind
+    }
+
+    private enum Activity {
+        case idle
+        case recording(UUID)
+        case recovering(UUID)
+    }
+
+    private var activity: Activity = .idle
+
+    public init() {}
+
+    func acquireRecording() throws -> Lease {
+        switch activity {
+        case .idle:
+            let lease = Lease(identifier: UUID(), kind: .recording)
+            activity = .recording(lease.identifier)
+            return lease
+        case .recording:
+            throw RecordingFailure(code: .capture, message: "已有录音正在进行，请先停止当前录音。")
+        case .recovering:
+            throw RecordingFailure(code: .capture, message: "正在恢复上次中断的录音，请恢复完成后再开始。")
+        }
+    }
+
+    func acquireRecovery() throws -> Lease {
+        switch activity {
+        case .idle:
+            let lease = Lease(identifier: UUID(), kind: .recovering)
+            activity = .recovering(lease.identifier)
+            return lease
+        case .recording:
+            throw RecordingFailure(code: .capture, message: "录音正在进行，停止录音后才能恢复中断文件。")
+        case .recovering:
+            throw RecordingFailure(code: .capture, message: "已有录音恢复任务正在进行。")
+        }
+    }
+
+    func release(_ lease: Lease) {
+        switch (activity, lease.kind) {
+        case let (.recording(identifier), .recording) where identifier == lease.identifier:
+            activity = .idle
+        case let (.recovering(identifier), .recovering) where identifier == lease.identifier:
+            activity = .idle
+        default:
+            return
+        }
+    }
+}
+
 public actor LiveRecordingSessionManager: RecordingSessionManaging {
     private enum State {
         case idle
@@ -63,17 +122,17 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
     private let mixerFactory: SessionMixerFactory
     private let now: @Sendable () -> Date
     private let sampleQueueCapacity: Int
-    private let recoveryInProgress: @Sendable () async -> Bool
+    private let activityGate: RecordingActivityGate
     private let eventsBroadcaster = RecordingSessionEventBroadcaster()
     private var state: State = .idle
 
     public init(
+        activityGate: RecordingActivityGate,
         store: RecordingStore = RecordingStore(),
         capture: any AudioCapturing = ScreenCaptureEngine(),
         permissions: any PermissionChecking = PermissionService(),
         sleep: any SleepPreventing = SleepPreventionService(),
-        notifications: any RecordingNotifying = NotificationService(),
-        recoveryService: RecoveryService? = nil
+        notifications: any RecordingNotifying = NotificationService()
     ) {
         self.store = store
         self.capture = capture
@@ -87,16 +146,11 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
         }
         now = Date.init
         sampleQueueCapacity = 64
-        if let recoveryService {
-            recoveryInProgress = { [weak recoveryService] in
-                await recoveryService?.isRecovering ?? false
-            }
-        } else {
-            recoveryInProgress = { false }
-        }
+        self.activityGate = activityGate
     }
 
     init(
+        activityGate: RecordingActivityGate,
         store: any RecordingSessionStoring,
         capture: any AudioCapturing,
         permissions: any PermissionChecking,
@@ -106,8 +160,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
         converterFactory: @escaping SessionConverterFactory,
         mixerFactory: @escaping SessionMixerFactory,
         now: @escaping @Sendable () -> Date,
-        sampleQueueCapacity: Int,
-        recoveryInProgress: @escaping @Sendable () async -> Bool
+        sampleQueueCapacity: Int
     ) {
         self.store = store
         self.capture = capture
@@ -119,7 +172,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
         self.mixerFactory = mixerFactory
         self.now = now
         self.sampleQueueCapacity = max(1, sampleQueueCapacity)
-        self.recoveryInProgress = recoveryInProgress
+        self.activityGate = activityGate
     }
 
     public func events() async -> AsyncStream<RecordingSessionEvent> {
@@ -133,6 +186,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
 
         let context = SessionContext(
             startedAt: date,
+            activityGate: activityGate,
             store: store,
             capture: capture,
             sleep: sleep
@@ -141,9 +195,8 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
         var stage = StartStage.checking
 
         do {
-            guard !(await recoveryInProgress()) else {
-                throw RecordingFailure(code: .capture, message: "正在恢复上次中断的录音，请稍后再开始。")
-            }
+            let lease = try await activityGate.acquireRecording()
+            context.holdActivityLease(lease)
             try ensureStarting(context)
 
             let permission = await permissions.currentStatus()
@@ -244,6 +297,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
         }
         await context.resources.endSleepIfNeeded()
         await context.resources.releaseReservationIfNeeded()
+        await context.releaseActivityLeaseIfNeeded()
     }
 
     private func pipelineFailed(contextID: UUID, failure: RecordingFailure) {
@@ -319,6 +373,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
             await context.resources.endSleepIfNeeded()
             await notifications.failed(failure)
             eventsBroadcaster.emit(.failed(failure))
+            await context.releaseActivityLeaseIfNeeded()
             return .failure(failure)
         }
 
@@ -361,6 +416,7 @@ public actor LiveRecordingSessionManager: RecordingSessionManaging {
             await notifications.failed(failure)
             eventsBroadcaster.emit(.failed(failure))
         }
+        await context.releaseActivityLeaseIfNeeded()
         return result
     }
 
@@ -428,15 +484,34 @@ private final class SessionContext: @unchecked Sendable {
     var cancelled = false
     var paths: RecordingPaths?
     var pipeline: SessionAudioPipeline?
+    private let activityLock = NSLock()
+    private let activityGate: RecordingActivityGate
+    private var activityLease: RecordingActivityGate.Lease?
 
     init(
         startedAt: Date,
+        activityGate: RecordingActivityGate,
         store: any RecordingSessionStoring,
         capture: any AudioCapturing,
         sleep: any SleepPreventing
     ) {
         self.startedAt = startedAt
+        self.activityGate = activityGate
         resources = SessionResources(store: store, capture: capture, sleep: sleep)
+    }
+
+    func holdActivityLease(_ lease: RecordingActivityGate.Lease) {
+        activityLock.withLock { activityLease = lease }
+    }
+
+    func releaseActivityLeaseIfNeeded() async {
+        let lease = activityLock.withLock {
+            let held = activityLease
+            activityLease = nil
+            return held
+        }
+        guard let lease else { return }
+        await activityGate.release(lease)
     }
 }
 
@@ -530,10 +605,11 @@ private actor SessionResources {
 
 private final class SessionAudioPipeline: @unchecked Sendable {
     private let lock = NSLock()
-    private let continuation: AsyncStream<AudioCaptureEvent>.Continuation
+    private let continuation: AsyncStream<CapturedAudioSample>.Continuation
     private let processor: SessionAudioProcessor
     private let worker: Task<Void, Never>
     private let emit: @Sendable (RecordingSessionEvent) -> Void
+    private let terminalRelay: SessionTerminalRelay
     private var accepting = true
 
     init(
@@ -545,37 +621,74 @@ private final class SessionAudioPipeline: @unchecked Sendable {
         terminal: @escaping @Sendable (RecordingFailure) -> Void
     ) {
         self.emit = emit
-        let events = AsyncStream<AudioCaptureEvent>.makeStream(
+        terminalRelay = SessionTerminalRelay(terminal: terminal)
+        let samples = AsyncStream<CapturedAudioSample>.makeStream(
             bufferingPolicy: .bufferingNewest(max(1, capacity))
         )
-        continuation = events.continuation
+        continuation = samples.continuation
         processor = SessionAudioProcessor(
             converter: converter,
             mixer: mixer,
             writer: writer,
             emit: emit,
-            terminal: terminal
+            terminalRelay: terminalRelay
         )
         let processor = self.processor
         worker = Task {
-            for await event in events.stream {
-                await processor.process(event)
+            for await sample in samples.stream {
+                await processor.process(sample)
             }
+        }
+        terminalRelay.setCloseSamples { [weak self] in
+            self?.closeForFatalEvent()
         }
     }
 
     func offer(_ event: AudioCaptureEvent) {
-        let result = lock.withLock {
-            guard accepting else { return AsyncStream<AudioCaptureEvent>.Continuation.YieldResult.terminated }
-            return continuation.yield(event)
-        }
-        if case let .dropped(dropped) = result {
-            if case .sample = dropped {
+        switch event {
+        case let .sample(sample):
+            let result = lock.withLock {
+                guard accepting else {
+                    return AsyncStream<CapturedAudioSample>.Continuation.YieldResult.terminated
+                }
+                return continuation.yield(sample)
+            }
+            if case .dropped = result {
                 emit(.warning(RecordingFailure(
                     code: .write,
                     message: "音频处理速度跟不上输入，已丢弃一小段样本。"
                 )))
             }
+        case let .warning(failure):
+            guard isAccepting else { return }
+            if failure.code == .microphone {
+                emit(.warning(failure))
+            } else {
+                terminalRelay.report(failure)
+            }
+        case let .microphoneChanged(identifier):
+            guard isAccepting else { return }
+            emit(.warning(RecordingFailure(
+                code: .microphone,
+                message: "麦克风已切换为：\(identifier)。"
+            )))
+        case let .stopped(failure):
+            guard isAccepting else { return }
+            terminalRelay.report(failure ?? RecordingFailure(
+                code: .capture,
+                message: "系统音频捕获意外停止。"
+            ))
+        }
+    }
+
+    private var isAccepting: Bool {
+        lock.withLock { accepting }
+    }
+
+    private func closeForFatalEvent() {
+        lock.withLock {
+            accepting = false
+            continuation.finish()
         }
     }
 
@@ -596,7 +709,7 @@ private final class SessionAudioPipeline: @unchecked Sendable {
     }
 
     func terminalFailure() async -> RecordingFailure? {
-        await processor.currentTerminalFailure
+        terminalRelay.currentFailure
     }
 
     deinit {
@@ -605,16 +718,45 @@ private final class SessionAudioPipeline: @unchecked Sendable {
     }
 }
 
+private final class SessionTerminalRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private let terminal: @Sendable (RecordingFailure) -> Void
+    private var closeSamples: (@Sendable () -> Void)?
+    private var failure: RecordingFailure?
+
+    init(terminal: @escaping @Sendable (RecordingFailure) -> Void) {
+        self.terminal = terminal
+    }
+
+    var currentFailure: RecordingFailure? {
+        lock.withLock { failure }
+    }
+
+    func setCloseSamples(_ closeSamples: @escaping @Sendable () -> Void) {
+        lock.withLock { self.closeSamples = closeSamples }
+    }
+
+    func report(_ failure: RecordingFailure) {
+        let close = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard self.failure == nil else { return nil }
+            self.failure = failure
+            return closeSamples
+        }
+        guard let close else { return }
+        close()
+        terminal(failure)
+    }
+}
+
 private actor SessionAudioProcessor {
     private let converter: any AudioSampleConverting
     private var mixer: any AudioMixing
     private let writer: any RecoverableAudioWriting
     private let emit: @Sendable (RecordingSessionEvent) -> Void
-    private let terminal: @Sendable (RecordingFailure) -> Void
+    private let terminalRelay: SessionTerminalRelay
     private var origin: CMTime?
     private var levels = AudioLevels.silent
     private var emittedMixerWarningCount = 0
-    private(set) var currentTerminalFailure: RecordingFailure?
     private var drained = false
 
     init(
@@ -622,55 +764,36 @@ private actor SessionAudioProcessor {
         mixer: any AudioMixing,
         writer: any RecoverableAudioWriting,
         emit: @escaping @Sendable (RecordingSessionEvent) -> Void,
-        terminal: @escaping @Sendable (RecordingFailure) -> Void
+        terminalRelay: SessionTerminalRelay
     ) {
         self.converter = converter
         self.mixer = mixer
         self.writer = writer
         self.emit = emit
-        self.terminal = terminal
+        self.terminalRelay = terminalRelay
     }
 
-    func process(_ event: AudioCaptureEvent) async {
-        guard currentTerminalFailure == nil else { return }
-        switch event {
-        case let .sample(sample):
-            do {
-                let sessionOrigin = origin ?? sample.presentationTime
-                origin = sessionOrigin
-                let converted = try converter.convert(sample, sessionStartPTS: sessionOrigin)
-                guard let chunk = Self.trimmingFramesBeforeSessionStart(converted) else {
-                    return
-                }
-                updateLevel(from: chunk)
-                try await append(mixer.ingest(chunk))
-                emitNewMixerWarnings()
-            } catch {
-                fail(Self.failure(from: error, fallbackCode: .write))
+    func process(_ sample: CapturedAudioSample) async {
+        guard terminalRelay.currentFailure == nil else { return }
+        do {
+            let sessionOrigin = origin ?? sample.presentationTime
+            origin = sessionOrigin
+            let converted = try converter.convert(sample, sessionStartPTS: sessionOrigin)
+            guard let chunk = Self.trimmingFramesBeforeSessionStart(converted) else {
+                return
             }
-        case let .warning(failure):
-            if failure.code == .microphone {
-                emit(.warning(failure))
-            } else {
-                fail(failure)
-            }
-        case let .microphoneChanged(identifier):
-            emit(.warning(RecordingFailure(
-                code: .microphone,
-                message: "麦克风已切换为：\(identifier)。"
-            )))
-        case let .stopped(failure):
-            fail(failure ?? RecordingFailure(
-                code: .capture,
-                message: "系统音频捕获意外停止。"
-            ))
+            updateLevel(from: chunk)
+            try await append(mixer.ingest(chunk))
+            emitNewMixerWarnings()
+        } catch {
+            fail(Self.failure(from: error, fallbackCode: .write))
         }
     }
 
     func drainAndFlush() async -> RecordingFailure? {
-        guard !drained else { return currentTerminalFailure }
+        guard !drained else { return terminalRelay.currentFailure }
         drained = true
-        guard currentTerminalFailure == nil else { return currentTerminalFailure }
+        guard terminalRelay.currentFailure == nil else { return terminalRelay.currentFailure }
         do {
             for source in [CapturedAudioSource.system, .microphone] {
                 for converted in try converter.drain(source: source) {
@@ -686,7 +809,7 @@ private actor SessionAudioProcessor {
         } catch {
             fail(Self.failure(from: error, fallbackCode: .write))
         }
-        return currentTerminalFailure
+        return terminalRelay.currentFailure
     }
 
     private func append(_ chunks: [MixedAudioChunk]) async throws {
@@ -723,9 +846,7 @@ private actor SessionAudioProcessor {
     }
 
     private func fail(_ failure: RecordingFailure) {
-        guard currentTerminalFailure == nil else { return }
-        currentTerminalFailure = failure
-        terminal(failure)
+        terminalRelay.report(failure)
     }
 
     private nonisolated static func failure(

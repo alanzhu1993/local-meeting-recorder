@@ -29,50 +29,82 @@ extension M4AFinalizer: InterruptedRecordingFinalizing {}
 
 public actor RecoveryService {
     public private(set) var isRecovering = false
+    public private(set) var lastFailure: RecordingFailure?
 
+    private let activityGate: RecordingActivityGate
     private let store: any InterruptedRecordingStoring
     private let finalizer: any InterruptedRecordingFinalizing
+    private let beforeCreatorCompletion: @Sendable () async -> Void
+    private let onJoin: @Sendable () -> Void
     private var inFlight: (
         identifier: UUID,
-        task: Task<[RecoveryResult], Never>
+        task: Task<RecoveryOperationOutcome, Never>
     )?
 
     public init(
+        activityGate: RecordingActivityGate,
         store: RecordingStore = RecordingStore(),
         finalizer: M4AFinalizer = M4AFinalizer()
     ) {
+        self.activityGate = activityGate
         self.store = store
         self.finalizer = finalizer
+        beforeCreatorCompletion = {}
+        onJoin = {}
     }
 
     init(
+        activityGate: RecordingActivityGate,
         store: any InterruptedRecordingStoring,
-        finalizer: any InterruptedRecordingFinalizing
+        finalizer: any InterruptedRecordingFinalizing,
+        beforeCreatorCompletion: @escaping @Sendable () async -> Void = {},
+        onJoin: @escaping @Sendable () -> Void = {}
     ) {
+        self.activityGate = activityGate
         self.store = store
         self.finalizer = finalizer
+        self.beforeCreatorCompletion = beforeCreatorCompletion
+        self.onJoin = onJoin
     }
 
     public func recoverInterruptedRecordings() async -> [RecoveryResult] {
         if let inFlight {
-            return await inFlight.task.value
+            onJoin()
+            let outcome = await inFlight.task.value
+            completeRecovery(identifier: inFlight.identifier, outcome: outcome)
+            return outcome.results
         }
 
         let identifier = UUID()
+        let activityGate = self.activityGate
         let store = self.store
         let finalizer = self.finalizer
         let task = Task {
-            await Self.performRecovery(store: store, finalizer: finalizer)
+            do {
+                let lease = try await activityGate.acquireRecovery()
+                let results = await Self.performRecovery(store: store, finalizer: finalizer)
+                await activityGate.release(lease)
+                return RecoveryOperationOutcome(results: results, failure: nil)
+            } catch {
+                let failure = Self.failure(from: error)
+                return RecoveryOperationOutcome(results: [], failure: failure)
+            }
         }
         inFlight = (identifier, task)
         isRecovering = true
+        lastFailure = nil
 
-        let results = await task.value
-        if inFlight?.identifier == identifier {
-            inFlight = nil
-            isRecovering = false
-        }
-        return results
+        let outcome = await task.value
+        await beforeCreatorCompletion()
+        completeRecovery(identifier: identifier, outcome: outcome)
+        return outcome.results
+    }
+
+    private func completeRecovery(identifier: UUID, outcome: RecoveryOperationOutcome) {
+        guard inFlight?.identifier == identifier else { return }
+        inFlight = nil
+        isRecovering = false
+        lastFailure = outcome.failure
     }
 
     private nonisolated static func performRecovery(
@@ -127,4 +159,14 @@ public actor RecoveryService {
         if let failure = error as? RecordingFailure { return failure.message }
         return error.localizedDescription
     }
+
+    private nonisolated static func failure(from error: Error) -> RecordingFailure {
+        if let failure = error as? RecordingFailure { return failure }
+        return RecordingFailure(code: .capture, message: error.localizedDescription)
+    }
+}
+
+private struct RecoveryOperationOutcome: Sendable {
+    let results: [RecoveryResult]
+    let failure: RecordingFailure?
 }

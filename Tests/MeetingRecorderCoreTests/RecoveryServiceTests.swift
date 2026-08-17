@@ -17,7 +17,11 @@ final class RecoveryServiceTests: XCTestCase {
             recoveredURLs: [first: firstOutput, second: secondOutput]
         )
         let finalizer = RecoveryFinalizerSpy(failingURLs: [first])
-        let service = RecoveryService(store: store, finalizer: finalizer)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
 
         let results = await service.recoverInterruptedRecordings()
 
@@ -42,7 +46,11 @@ final class RecoveryServiceTests: XCTestCase {
         let store = RecoveryStoreSpy(interrupted: [working], recoveredURLs: [working: output])
         let gate = RecoveryAsyncGate()
         let finalizer = RecoveryFinalizerSpy(gate: gate)
-        let service = RecoveryService(store: store, finalizer: finalizer)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
 
         let first = Task { await service.recoverInterruptedRecordings() }
         await finalizer.waitUntilEntered()
@@ -66,6 +74,40 @@ final class RecoveryServiceTests: XCTestCase {
         XCTAssertEqual(releasedURLs, [output])
     }
 
+    func testJoinerCompletesRecoveringStateBeforeReturningEvenWhenCreatorIsDelayed() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let working = directory.appendingPathComponent("working.inprogress.mov")
+        let output = directory.appendingPathComponent("recovered.m4a")
+        try Data("working".utf8).write(to: working)
+        let store = RecoveryStoreSpy(interrupted: [working], recoveredURLs: [working: output])
+        let recoveryGate = RecoveryAsyncGate()
+        let creatorCompletionGate = RecoveryAsyncGate()
+        let joinObserved = RecoverySignal()
+        let finalizer = RecoveryFinalizerSpy(gate: recoveryGate)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer,
+            beforeCreatorCompletion: { await creatorCompletionGate.wait() },
+            onJoin: { joinObserved.signal() }
+        )
+
+        let creator = Task { await service.recoverInterruptedRecordings() }
+        await finalizer.waitUntilEntered()
+        let joiner = Task { await service.recoverInterruptedRecordings() }
+        await joinObserved.wait()
+        await recoveryGate.open()
+
+        let joinerResults = await joiner.value
+        XCTAssertEqual(joinerResults, [RecoveryResult(outcome: .recovered(output))])
+        let isRecovering = await service.isRecovering
+        XCTAssertFalse(isRecovering)
+        await creatorCompletionGate.open()
+        let creatorResults = await creator.value
+        XCTAssertEqual(creatorResults, joinerResults)
+    }
+
     func testDuplicateScanEntriesAreRecoveredOnlyOnce() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -77,7 +119,11 @@ final class RecoveryServiceTests: XCTestCase {
             recoveredURLs: [working: output]
         )
         let finalizer = RecoveryFinalizerSpy()
-        let service = RecoveryService(store: store, finalizer: finalizer)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
 
         let results = await service.recoverInterruptedRecordings()
 
@@ -102,7 +148,11 @@ final class RecoveryServiceTests: XCTestCase {
         await writer.abort()
         let store = RecordingStore(root: root, availableCapacity: { 2_000_000_000 })
         let finalizer = RecoveryFinalizerSpy()
-        let service = RecoveryService(store: store, finalizer: finalizer)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
 
         let results = await service.recoverInterruptedRecordings()
 
@@ -134,7 +184,11 @@ final class RecoveryServiceTests: XCTestCase {
             listError: RecordingFailure(code: .write, message: "scan failed")
         )
         let finalizer = RecoveryFinalizerSpy()
-        let service = RecoveryService(store: store, finalizer: finalizer)
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
 
         let results = await service.recoverInterruptedRecordings()
 
@@ -143,6 +197,37 @@ final class RecoveryServiceTests: XCTestCase {
         let callCount = await finalizer.callCount
         XCTAssertFalse(isRecovering)
         XCTAssertEqual(callCount, 0)
+    }
+
+    func testRecoveredURLFailureIsIsolatedAndDoesNotReleaseUnknownReservation() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = directory.appendingPathComponent("first.inprogress.mov")
+        let second = directory.appendingPathComponent("second.inprogress.mov")
+        let secondOutput = directory.appendingPathComponent("second-recovered.m4a")
+        let store = RecoveryStoreSpy(
+            interrupted: [first, second],
+            recoveredURLs: [second: secondOutput]
+        )
+        let finalizer = RecoveryFinalizerSpy()
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: finalizer
+        )
+
+        let results = await service.recoverInterruptedRecordings()
+
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(
+            results[0],
+            RecoveryResult(outcome: .failed(first, "missing recovery output"))
+        )
+        XCTAssertEqual(results[1], RecoveryResult(outcome: .recovered(secondOutput)))
+        let workingURLs = await finalizer.workingURLs
+        let releasedURLs = await store.releasedURLs
+        XCTAssertEqual(workingURLs, [second])
+        XCTAssertEqual(releasedURLs, [secondOutput])
     }
 }
 
@@ -221,6 +306,19 @@ private actor RecoveryAsyncGate {
         let current = waiters
         waiters.removeAll()
         current.forEach { $0.resume() }
+    }
+}
+
+private final class RecoverySignal: @unchecked Sendable {
+    private let stream = AsyncStream<Void>.makeStream()
+
+    func signal() {
+        stream.continuation.yield()
+    }
+
+    func wait() async {
+        var iterator = stream.stream.makeAsyncIterator()
+        _ = await iterator.next()
     }
 }
 
