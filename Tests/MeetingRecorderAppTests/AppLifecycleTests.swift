@@ -5,30 +5,131 @@ import XCTest
 
 @MainActor
 final class AppLifecycleTests: XCTestCase {
-    func testProductionCompositionUsesOneSharedInstanceForCrossCuttingServices() {
+    func testProductionCompositionRecordingLeaseBlocksRootRecoveryAndUsesLaunchStore() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: rootURL) }
         let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
+        AppSettingsStore(defaults: defaults).save(AppSettings(
+            recordingRoot: rootURL,
+            hotkey: .init(keyCode: 15, modifiers: 0x1800, displayText: "⌘R"),
+            launchAtLogin: false
+        ))
+        let capture = CompositionBlockingCapture()
         let composition = ProductionCompositionRoot(
             settingsStore: AppSettingsStore(defaults: defaults),
-            notificationService: NotificationService(backend: CompositionNotificationBackend())
+            permissions: CompositionPermissionSpy(status: CapturePermissionStatus(missing: [])),
+            capture: capture,
+            sleep: CompositionSleepSpy(),
+            notifications: CompositionNotificationSpy(),
+            recoveryFactory: { activityGate, store in
+                RecoveryService(
+                    activityGate: activityGate,
+                    store: store,
+                    finalizer: LifecycleRecoveryFinalizerSpy()
+                )
+            }
         )
-        let action = PermissionGatedRecordingAction(
-            permissions: composition.permissions,
-            phase: { .idle },
-            toggle: {},
-            updatePermissionMessage: { _ in }
+
+        let start = Task { try await composition.session.start(at: Date(timeIntervalSince1970: 1_700_000_000)) }
+        await capture.waitUntilStartEntered()
+        let blockedRecovery = await composition.recovery.recoverInterruptedRecordingsBatch()
+        let workingFiles = (FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: nil
+        )?.allObjects as? [URL] ?? []).filter {
+            $0.lastPathComponent.contains("inprogress")
+        }
+        let canonicalRootPath = rootURL.path.hasPrefix("/var/")
+            ? "/private\(rootURL.path)"
+            : rootURL.path
+
+        XCTAssertEqual(blockedRecovery.batchFailure?.code, .capture)
+        XCTAssertTrue(blockedRecovery.batchFailure?.message.contains("录音正在进行") == true)
+        XCTAssertEqual(workingFiles.count, 1)
+        XCTAssertTrue(workingFiles[0].path.hasPrefix(canonicalRootPath + "/"))
+
+        _ = try? await composition.session.stop()
+        _ = try? await start.value
+        let recovery = await composition.recovery.recoverInterruptedRecordingsBatch()
+
+        XCTAssertEqual(recovery.results.count, 1)
+        let recoveredPath: String
+        switch recovery.results[0].outcome {
+        case let .recovered(url): recoveredPath = url.path
+        case let .failed(url, _): recoveredPath = url.path
+        }
+        XCTAssertTrue(recoveredPath.hasPrefix(canonicalRootPath + "/"))
+    }
+
+    func testProductionCompositionRecoveryLeaseBlocksRootSession() async {
+        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let recoveryEntered = CompositionSignal()
+        let releaseRecovery = LifecycleAsyncGate()
+        let composition = ProductionCompositionRoot(
+            settingsStore: AppSettingsStore(defaults: defaults),
+            permissions: CompositionPermissionSpy(status: CapturePermissionStatus(missing: [])),
+            capture: CompositionBlockingCapture(),
+            sleep: CompositionSleepSpy(),
+            notifications: CompositionNotificationSpy(),
+            recoveryFactory: { activityGate, store in
+                RecoveryService(
+                    activityGate: activityGate,
+                    store: store,
+                    finalizer: M4AFinalizer(),
+                    afterLeaseAcquired: {
+                        recoveryEntered.signal()
+                        await releaseRecovery.wait()
+                    }
+                )
+            }
         )
-        let entrypoint = RecordingActionEntrypoint(action: action)
 
-        let snapshot = composition.identitySnapshot(action: action, entrypoint: entrypoint)
+        let recovery = Task { await composition.recovery.recoverInterruptedRecordingsBatch() }
+        await recoveryEntered.wait()
+        do {
+            _ = try await composition.session.start(at: Date())
+            XCTFail("Expected the root session to be rejected while root recovery owns the gate.")
+        } catch let failure as RecordingFailure {
+            XCTAssertEqual(failure.code, .capture)
+            XCTAssertTrue(failure.message.contains("正在恢复"))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        await releaseRecovery.open()
+        _ = await recovery.value
+    }
 
-        XCTAssertEqual(snapshot.permissionForAction, snapshot.permissionForSession)
-        XCTAssertEqual(snapshot.activityGateForSession, snapshot.activityGateForRecovery)
-        XCTAssertEqual(snapshot.storeForSession, snapshot.storeForRecovery)
-        XCTAssertEqual(snapshot.notificationForSession, snapshot.notificationHeldByApp)
-        XCTAssertEqual(snapshot.buttonActionEntrypoint, snapshot.hotkeyActionEntrypoint)
-        XCTAssertEqual(snapshot.launchRecordingRoot, snapshot.storeRecordingRoot)
+    func testProductionMenuAndHotkeyHandlersUseInjectedPermissionService() async {
+        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let permissions = CompositionPermissionSpy(
+            status: CapturePermissionStatus(missing: [.systemAudio])
+        )
+        let composition = ProductionCompositionRoot(
+            settingsStore: AppSettingsStore(defaults: defaults),
+            permissions: permissions,
+            capture: CompositionBlockingCapture(),
+            sleep: CompositionSleepSpy(),
+            notifications: CompositionNotificationSpy()
+        )
+
+        composition.menuRecordingHandler()
+        await permissions.waitForRequestCount(1)
+        await permissions.waitForCurrentCount(2)
+        composition.hotkeyRecordingHandler()
+        await permissions.waitForRequestCount(2)
+        await permissions.waitForCurrentCount(4)
+
+        let counts = await permissions.counts
+        XCTAssertEqual(counts.current, 4)
+        XCTAssertEqual(counts.request, 2)
     }
 
     func testLaunchRecoversBeforeEnablingHotkey() async {
@@ -86,6 +187,52 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertTrue(harness.feedbacks[0].message.contains("scan denied"))
         XCTAssertEqual(harness.feedbacks[0].revealURL, root)
         XCTAssertTrue(harness.feedbacks[0].isFailure)
+    }
+
+    func testFirstBatchFailureRemainsVisibleWhenSecondBatchSucceedsBeforeLifecycleConsumesIt() async {
+        let root = URL(fileURLWithPath: "/tmp/atomic-recovery-root", isDirectory: true)
+        let store = LifecycleSequencedRecoveryStore(outcomes: [
+            .failure(RecordingFailure(code: .write, message: "first batch scan failed")),
+            .success([]),
+        ])
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: LifecycleRecoveryFinalizerSpy()
+        )
+        let allowFirstConsumer = LifecycleAsyncGate()
+        var firstBatchReturned = false
+        var feedbacks: [RecoveryFeedback] = []
+        let lifecycle = AppLifecycle(
+            showMenu: {},
+            setRecoveryStatus: { _, _ in },
+            recoveryRoot: root,
+            recover: {
+                let batch = await service.recoverInterruptedRecordingsBatch()
+                firstBatchReturned = true
+                await allowFirstConsumer.wait()
+                return batch
+            },
+            notifyRecoveryResult: { _ in },
+            publishRecoveryFeedback: { feedbacks.append($0) },
+            registerHotkey: {},
+            applyLoginItemSetting: {},
+            startupError: { _ in },
+            phase: { .idle },
+            stopRecording: {},
+            awaitSessionStop: {}
+        )
+
+        lifecycle.start()
+        while !firstBatchReturned { await Task.yield() }
+        let secondBatch = await service.recoverInterruptedRecordingsBatch()
+        await allowFirstConsumer.open()
+        await lifecycle.waitForLaunch()
+
+        XCTAssertNil(secondBatch.batchFailure)
+        XCTAssertEqual(feedbacks.count, 1)
+        XCTAssertTrue(feedbacks[0].message.contains(root.path))
+        XCTAssertTrue(feedbacks[0].message.contains("first batch scan failed"))
     }
 
     func testStartupServiceErrorsRemainVisibleWithoutStoppingLaterSteps() async {
@@ -280,6 +427,19 @@ final class InstallScriptIntegrationTests: XCTestCase {
         ))
     }
 
+    func testFirstInstallDittoPartialFailurePreservesFailedArtifactWithoutFormalTarget() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        harness.environment["MEETING_RECORDER_DITTO_TOOL"] = harness.dittoPartialFailure.path
+
+        let result = try harness.run()
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.targetApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.appendingPathComponent("partial").path))
+    }
+
     func testBackupNameCollisionUsesIncrementedUniqueName() throws {
         let harness = try InstallScriptHarness()
         defer { harness.cleanup() }
@@ -327,7 +487,8 @@ final class InstallScriptIntegrationTests: XCTestCase {
         let result = try harness.run()
 
         XCTAssertNotEqual(result.status, 0)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.targetApp.appendingPathComponent("partial").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.targetApp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: harness.failedApp.appendingPathComponent("partial").path))
         XCTAssertEqual(
             try String(contentsOf: harness.backupApp.appendingPathComponent("marker"), encoding: .utf8),
             "old"
@@ -451,7 +612,13 @@ private final class InstallScriptHarness {
         mvRestoreFailure = toolsRoot.appendingPathComponent("mv-restore-failure")
         try Self.writeTool(mvRestoreFailure, """
             #!/bin/zsh
-            if [[ "$2" == *"会议录音-failed-"* ]]; then exit 10; fi
+            source="${1:A}"
+            destination="${2:A}"
+            expected_backup='\(backupApp.path)'
+            expected_target='\(targetApp.path)'
+            expected_backup="${expected_backup:A}"
+            expected_target="${expected_target:A}"
+            if [[ "$source" == "$expected_backup" && "$destination" == "$expected_target" ]]; then exit 10; fi
             /bin/mv "$1" "$2"
             """)
 
@@ -602,7 +769,7 @@ private final class LiveLifecycleHarness {
             showMenu: {},
             setRecoveryStatus: { _, _ in },
             recoveryRoot: directory,
-            recover: { [] },
+            recover: { RecoveryBatchResult(results: [], batchFailure: nil) },
             notifyRecoveryResult: { _ in },
             registerHotkey: {},
             applyLoginItemSetting: {},
@@ -671,8 +838,80 @@ private actor LifecycleNotificationSpy: RecordingNotifying {
     func failed(_ failure: RecordingFailure) async {}
 }
 
-private actor CompositionNotificationBackend: RecordingNotificationBacking {
-    func deliver(_ notification: RecordingNotification) async {}
+private actor CompositionPermissionSpy: PermissionChecking {
+    private let status: CapturePermissionStatus
+    private var currentCount = 0
+    private var requestCount = 0
+
+    init(status: CapturePermissionStatus) {
+        self.status = status
+    }
+
+    func currentStatus() async -> CapturePermissionStatus {
+        currentCount += 1
+        return status
+    }
+
+    func requestMissingPermissions() async -> CapturePermissionStatus {
+        requestCount += 1
+        return status
+    }
+
+    var counts: (current: Int, request: Int) {
+        (currentCount, requestCount)
+    }
+
+    func waitForRequestCount(_ expected: Int) async {
+        while requestCount < expected { await Task.yield() }
+    }
+
+    func waitForCurrentCount(_ expected: Int) async {
+        while currentCount < expected { await Task.yield() }
+    }
+}
+
+private actor CompositionBlockingCapture: AudioCapturing {
+    private let gate = LifecycleAsyncGate()
+    private var startEntered = false
+
+    func start(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) async throws {
+        startEntered = true
+        await gate.wait()
+        throw CancellationError()
+    }
+
+    func stop() async {
+        await gate.open()
+    }
+
+    func updateDefaultMicrophone() async throws {}
+
+    func waitUntilStartEntered() async {
+        while !startEntered { await Task.yield() }
+    }
+}
+
+private final class CompositionSleepSpy: SleepPreventing, @unchecked Sendable {
+    func begin() {}
+    func end() {}
+}
+
+private actor CompositionNotificationSpy: RecordingNotifying {
+    func saved(_ recording: SavedRecording) async {}
+    func failed(_ failure: RecordingFailure) async {}
+}
+
+private final class CompositionSignal: @unchecked Sendable {
+    private let signalStream = AsyncStream<Void>.makeStream()
+
+    func signal() {
+        signalStream.continuation.yield()
+    }
+
+    func wait() async {
+        var iterator = signalStream.stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
 }
 
 private actor LifecycleWriterSpy: RecoverableAudioWriting {
@@ -845,7 +1084,7 @@ private final class RecoveryServiceSpy {
         messages.append(message)
     }
 
-    func run() async throws -> [RecoveryResult] {
+    func run() async -> RecoveryBatchResult {
         calls.calls.append("recovery.run")
         entered = true
         if suspend {
@@ -853,8 +1092,11 @@ private final class RecoveryServiceSpy {
                 self.continuation = continuation
             }
         }
-        if let error { throw error }
-        return results
+        let failure = error.map { error in
+            if let failure = error as? RecordingFailure { return failure }
+            return RecordingFailure(code: .write, message: error.localizedDescription)
+        }
+        return RecoveryBatchResult(results: results, batchFailure: failure)
     }
 
     func waitUntilEntered() async {
@@ -866,6 +1108,31 @@ private final class RecoveryServiceSpy {
     func finish() {
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private actor LifecycleSequencedRecoveryStore: InterruptedRecordingStoring {
+    private var outcomes: [Result<[URL], RecordingFailure>]
+
+    init(outcomes: [Result<[URL], RecordingFailure>]) {
+        self.outcomes = outcomes
+    }
+
+    func listInterruptedRecordings() async throws -> [URL] {
+        guard !outcomes.isEmpty else { return [] }
+        return try outcomes.removeFirst().get()
+    }
+
+    func recoveredURL(for workingURL: URL) async throws -> URL {
+        throw RecordingFailure(code: .write, message: "unexpected recoveredURL call")
+    }
+
+    func releaseReservation(for outputURL: URL) async {}
+}
+
+private actor LifecycleRecoveryFinalizerSpy: InterruptedRecordingFinalizing {
+    func recover(workingURL: URL, recoveredURL: URL) async throws -> URL {
+        recoveredURL
     }
 }
 

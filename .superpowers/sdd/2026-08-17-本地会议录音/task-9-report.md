@@ -69,3 +69,36 @@
 - 对旧进程的只读 sample 显示，异步任务仍在 `RecoveryService.recoverInterruptedRecordings()` → `RecoveryService.performRecovery` → `RecordingStore.listInterruptedRecordings()` → `NSURLDirectoryEnumerator.nextObject`。因此它一直把退出视为“恢复任务进行中”，返回 `terminateLater` 后无法完成 reply。sample 保存在 `/tmp/MeetingRecorderApp-95819-FixRound1.sample.txt`。
 - 默认录音目录 `/Users/alan/Documents/快速本地录音软件/录音文件` 已只读检查：所有文件数 `0`，working/manifest/segment 匹配数 `0`。未发现录音或恢复产物。
 - 本轮没有强制停止 PID `95819`，没有移动 `/Users/alan/Applications/会议录音.app`。现有 target 仍是 inode `126288769`。真实重新安装需等 Alan 另行授权精确 PID 强制停止，或在重启 Mac 后再运行脚本。
+
+## FixRound2 追加（2026-08-18）
+
+### 原子恢复批次
+
+- 新增不可变的 `RecoveryBatchResult`，同时携带 `[RecoveryResult]` 和该批次自己的 `batchFailure`。`RecoveryService` 的 in-flight task 和所有 coalesced callers 都拿到同一份批次值。
+- 旧的 `recoverInterruptedRecordings()` 仍保留为 wrapper，但 `AppLifecycle` 已直接消费 `recoverInterruptedRecordingsBatch()`，不再在返回后去 await 可被下一轮覆盖的 `lastFailure` / `lastBatchFailure`。
+- 新增两层 barrier 测试：Core 层让 batch 1 扫描失败返回后暂停消费者，先让 batch 2 成功，再确认 batch 1 仍保留自己的错误；AppLifecycle 层在同样时序下确认 UI 显示 batch 1 的 root 和原始错误。
+
+### 生产装配行为测试
+
+- 删除 `ProductionCompositionIdentitySnapshot`、`permissionServiceIdentity` 和 AppDelegate 中的 snapshot 保留字段，不再由 root 自己复制对象 id 来“证明”共用。
+- `ProductionCompositionRoot` 现在实际创建并持有 `PermissionGatedRecordingAction` / `RecordingActionEntrypoint`，对外给出菜单 action 和快捷键 handler。AppDelegate 的菜单按钮、启动快捷键注册、设置中重新注册和退出时停止全部使用 root 产生的入口。
+- 行为测试通过真实 `LiveRecordingSessionManager` 和 root recovery 验证双向互斥：录音 lease 持有时 root recovery 不会扫描；recovery lease 持有时 root session 在准备存储之前被拒绝。
+- 同一测试确认 root session 生成的 working file 位于临时 launch root，清理启动后 root recovery 能扫描到该文件，证明 session 和 recovery 实际使用同一 `RecordingStore` 根目录。
+- 注入一个可计数 `PermissionChecking` 后，分别调用 root 的 menu handler 和 hotkey handler，最终同一 spy 记录到 4 次 status check 和 2 次 request，证明两个入口都经过同一权限门。
+- 测试可注入 permission/capture/sleep/notification 和 recovery factory；AppDelegate 仍调用同一个 `ProductionCompositionRoot()` 默认构建路径，默认值仍是真实生产服务和 writer/converter/mixer factory。
+
+### 安装回滚测试更正
+
+- 上一轮 `restore move failure` fake 实际拦截了 `target → failed artifact`，不是需要验证的 `backup → target`。本轮 fake 会规范化 source/destination 绝对路径，只在 source 精确等于 backup 且 destination 精确等于正式 target 时返回失败。
+- 新断言确认：残缺新 target 已先移到 failed artifact，完整旧 app 仍在 backup，正式 target 不存在，脚本非 0 退出，唯一旧 app 没有丢失。
+- 新增“首次安装 + ditto 部分复制失败”用例：正式 target 不存在，partial 产物保留在 failed artifact，与首次安装 target 校验失败用例分开覆盖。
+
+### FixRound2 验证
+
+- `RecoveryServiceTests`：8 项通过。
+- `AppLifecycleTests`：16 项通过。
+- `InstallScriptIntegrationTests`：7 项通过，全部仅在 `mktemp` 安全目录中运行。
+- 全量 `swift test -Xswiftc -warnings-as-errors`：183 项，0 失败，1 项截图用例按环境跳过。
+- Release build 成功；产物为 arm64 Mach-O，ad-hoc 签名，`codesign --verify --deep --strict` 通过，bundle id 为 `com.alan.local-meeting-recorder`，`LSUIElement=true`。
+- `zsh -n scripts/install-local.sh` 和 `git diff --check` 通过。
+- 按 FixRound2 要求，本轮没有运行真实安装，没有停止进程，没有移动 `/Users/alan/Applications/会议录音.app`。

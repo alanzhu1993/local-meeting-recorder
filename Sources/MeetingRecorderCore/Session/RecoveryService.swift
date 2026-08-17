@@ -13,6 +13,38 @@ public struct RecoveryResult: Equatable, Sendable {
     }
 }
 
+public struct RecoveryBatchResult: Equatable, Sendable {
+    public let results: [RecoveryResult]
+    public let batchFailure: RecordingFailure?
+    fileprivate let failureOrigin: RecoveryBatchFailureOrigin
+
+    public init(results: [RecoveryResult], batchFailure: RecordingFailure?) {
+        self.results = results
+        self.batchFailure = batchFailure
+        failureOrigin = .batch
+    }
+
+    fileprivate init(
+        results: [RecoveryResult],
+        batchFailure: RecordingFailure?,
+        failureOrigin: RecoveryBatchFailureOrigin
+    ) {
+        self.results = results
+        self.batchFailure = batchFailure
+        self.failureOrigin = failureOrigin
+    }
+
+    public static func == (lhs: RecoveryBatchResult, rhs: RecoveryBatchResult) -> Bool {
+        lhs.results == rhs.results && lhs.batchFailure == rhs.batchFailure
+    }
+}
+
+private enum RecoveryBatchFailureOrigin: Equatable, Sendable {
+    case none
+    case activityGate
+    case batch
+}
+
 protocol InterruptedRecordingStoring: Sendable {
     func listInterruptedRecordings() async throws -> [URL]
     func recoveredURL(for workingURL: URL) async throws -> URL
@@ -35,11 +67,12 @@ public actor RecoveryService {
     private let activityGate: RecordingActivityGate
     private let store: any InterruptedRecordingStoring
     private let finalizer: any InterruptedRecordingFinalizing
+    private let afterLeaseAcquired: @Sendable () async -> Void
     private let beforeCreatorCompletion: @Sendable () async -> Void
     private let onJoin: @Sendable () -> Void
     private var inFlight: (
         identifier: UUID,
-        task: Task<RecoveryOperationOutcome, Never>
+        task: Task<RecoveryBatchResult, Never>
     )?
 
     public init(
@@ -50,6 +83,7 @@ public actor RecoveryService {
         self.activityGate = activityGate
         self.store = store
         self.finalizer = finalizer
+        afterLeaseAcquired = {}
         beforeCreatorCompletion = {}
         onJoin = {}
     }
@@ -58,44 +92,48 @@ public actor RecoveryService {
         activityGate: RecordingActivityGate,
         store: any InterruptedRecordingStoring,
         finalizer: any InterruptedRecordingFinalizing,
+        afterLeaseAcquired: @escaping @Sendable () async -> Void = {},
         beforeCreatorCompletion: @escaping @Sendable () async -> Void = {},
         onJoin: @escaping @Sendable () -> Void = {}
     ) {
         self.activityGate = activityGate
         self.store = store
         self.finalizer = finalizer
+        self.afterLeaseAcquired = afterLeaseAcquired
         self.beforeCreatorCompletion = beforeCreatorCompletion
         self.onJoin = onJoin
     }
 
     public func recoverInterruptedRecordings() async -> [RecoveryResult] {
+        await recoverInterruptedRecordingsBatch().results
+    }
+
+    public func recoverInterruptedRecordingsBatch() async -> RecoveryBatchResult {
         if let inFlight {
             onJoin()
-            let outcome = await inFlight.task.value
-            completeRecovery(identifier: inFlight.identifier, outcome: outcome)
-            return outcome.results
+            let batch = await inFlight.task.value
+            completeRecovery(identifier: inFlight.identifier, batch: batch)
+            return batch
         }
 
         let identifier = UUID()
         let activityGate = self.activityGate
         let store = self.store
         let finalizer = self.finalizer
+        let afterLeaseAcquired = self.afterLeaseAcquired
         let task = Task {
             do {
                 let lease = try await activityGate.acquireRecovery()
+                await afterLeaseAcquired()
                 let batch = await Self.performRecovery(store: store, finalizer: finalizer)
                 await activityGate.release(lease)
-                return RecoveryOperationOutcome(
-                    results: batch.results,
-                    failure: nil,
-                    batchFailure: batch.failure
-                )
+                return batch
             } catch {
                 let failure = Self.failure(from: error)
-                return RecoveryOperationOutcome(
+                return RecoveryBatchResult(
                     results: [],
-                    failure: failure,
-                    batchFailure: nil
+                    batchFailure: failure,
+                    failureOrigin: .activityGate
                 )
             }
         }
@@ -104,31 +142,41 @@ public actor RecoveryService {
         lastFailure = nil
         lastBatchFailure = nil
 
-        let outcome = await task.value
+        let batch = await task.value
         await beforeCreatorCompletion()
-        completeRecovery(identifier: identifier, outcome: outcome)
-        return outcome.results
+        completeRecovery(identifier: identifier, batch: batch)
+        return batch
     }
 
-    private func completeRecovery(identifier: UUID, outcome: RecoveryOperationOutcome) {
+    private func completeRecovery(identifier: UUID, batch: RecoveryBatchResult) {
         guard inFlight?.identifier == identifier else { return }
         inFlight = nil
         isRecovering = false
-        lastFailure = outcome.failure
-        lastBatchFailure = outcome.batchFailure
+        switch batch.failureOrigin {
+        case .activityGate:
+            lastFailure = batch.batchFailure
+            lastBatchFailure = nil
+        case .batch:
+            lastFailure = nil
+            lastBatchFailure = batch.batchFailure
+        case .none:
+            lastFailure = nil
+            lastBatchFailure = nil
+        }
     }
 
     private nonisolated static func performRecovery(
         store: any InterruptedRecordingStoring,
         finalizer: any InterruptedRecordingFinalizing
-    ) async -> RecoveryBatchOutcome {
+    ) async -> RecoveryBatchResult {
         let interrupted: [URL]
         do {
             interrupted = try await store.listInterruptedRecordings()
         } catch {
-            return RecoveryBatchOutcome(
+            return RecoveryBatchResult(
                 results: [],
-                failure: recoveryFailure(from: error)
+                batchFailure: recoveryFailure(from: error),
+                failureOrigin: .batch
             )
         }
 
@@ -166,7 +214,11 @@ public actor RecoveryService {
                 )))
             }
         }
-        return RecoveryBatchOutcome(results: results, failure: nil)
+        return RecoveryBatchResult(
+            results: results,
+            batchFailure: nil,
+            failureOrigin: .none
+        )
     }
 
     private nonisolated static func failureMessage(_ error: Error) -> String {
@@ -183,15 +235,4 @@ public actor RecoveryService {
         if let failure = error as? RecordingFailure { return failure }
         return RecordingFailure(code: .write, message: error.localizedDescription)
     }
-}
-
-private struct RecoveryOperationOutcome: Sendable {
-    let results: [RecoveryResult]
-    let failure: RecordingFailure?
-    let batchFailure: RecordingFailure?
-}
-
-private struct RecoveryBatchOutcome: Sendable {
-    let results: [RecoveryResult]
-    let failure: RecordingFailure?
 }

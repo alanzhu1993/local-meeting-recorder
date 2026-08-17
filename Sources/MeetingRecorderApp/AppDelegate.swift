@@ -8,7 +8,6 @@ final class PermissionGatedRecordingAction {
     private let toggle: () async -> Void
     private let updatePermissionMessage: (String?) -> Void
     private var requestInFlight = false
-    let permissionServiceIdentity: ObjectIdentifier
 
     init(
         permissions: any PermissionChecking,
@@ -17,7 +16,6 @@ final class PermissionGatedRecordingAction {
         updatePermissionMessage: @escaping (String?) -> Void
     ) {
         self.permissions = permissions
-        permissionServiceIdentity = ObjectIdentifier(permissions as AnyObject)
         self.phase = phase
         self.toggle = toggle
         self.updatePermissionMessage = updatePermissionMessage
@@ -77,7 +75,7 @@ final class AppLifecycle {
     private let showMenu: () -> Void
     private let setRecoveryStatus: (Bool, String?) -> Void
     private let recoveryRoot: URL
-    private let recover: () async throws -> [RecoveryResult]
+    private let recover: () async -> RecoveryBatchResult
     private let notifyRecoveryResult: (RecoveryResult) async -> Void
     private let publishRecoveryFeedback: (RecoveryFeedback) -> Void
     private let registerHotkey: () throws -> Void
@@ -97,7 +95,7 @@ final class AppLifecycle {
         showMenu: @escaping () -> Void,
         setRecoveryStatus: @escaping (Bool, String?) -> Void,
         recoveryRoot: URL = AppMetadata.defaultRecordingRoot,
-        recover: @escaping () async throws -> [RecoveryResult],
+        recover: @escaping () async -> RecoveryBatchResult,
         notifyRecoveryResult: @escaping (RecoveryResult) async -> Void,
         publishRecoveryFeedback: @escaping (RecoveryFeedback) -> Void = { _ in },
         registerHotkey: @escaping () throws -> Void,
@@ -187,7 +185,9 @@ final class AppLifecycle {
 
     private func finishLaunch() async {
         do {
-            let results = try await recover()
+            let batch = await recover()
+            if let failure = batch.batchFailure { throw failure }
+            let results = batch.results
             for result in results {
                 setRecoveryStatus(true, Self.message(for: result))
                 await notifyRecoveryResult(result)
@@ -292,50 +292,48 @@ struct LaunchRecordingLocation {
     }
 }
 
-struct ProductionCompositionIdentitySnapshot: Equatable {
-    let permissionForAction: ObjectIdentifier
-    let permissionForSession: ObjectIdentifier
-    let activityGateForSession: ObjectIdentifier
-    let activityGateForRecovery: ObjectIdentifier
-    let storeForSession: ObjectIdentifier
-    let storeForRecovery: ObjectIdentifier
-    let notificationForSession: ObjectIdentifier
-    let notificationHeldByApp: ObjectIdentifier
-    let buttonActionEntrypoint: ObjectIdentifier
-    let hotkeyActionEntrypoint: ObjectIdentifier
-    let launchRecordingRoot: URL
-    let storeRecordingRoot: URL
+@MainActor
+private final class PermissionMessageRelay {
+    var handler: (String?) -> Void = { _ in }
+
+    func publish(_ message: String?) {
+        handler(message)
+    }
 }
 
 @MainActor
 final class ProductionCompositionRoot {
     let settingsStore: AppSettingsStore
     let launchSettings: AppSettings
-    let permissions: PermissionService
+    let permissions: any PermissionChecking
     let activityGate: RecordingActivityGate
     let recordingStore: RecordingStore
-    let capture: ScreenCaptureEngine
-    let sleep: SleepPreventionService
-    let notifications: NotificationService
+    let capture: any AudioCapturing
+    let sleep: any SleepPreventing
+    let notifications: any RecordingNotifying
     let session: LiveRecordingSessionManager
     let recovery: RecoveryService
     let coordinator: RecordingCoordinator
     let hotkey: HotkeyService
     let loginItem: LoginItemService
+    let recordingEntrypoint: RecordingActionEntrypoint
+    let menuRecordingHandler: @Sendable () -> Void
+    let hotkeyRecordingHandler: @Sendable () -> Void
+    private let permissionMessageRelay: PermissionMessageRelay
 
     init(
         settingsStore: AppSettingsStore = AppSettingsStore(),
-        notificationService: NotificationService? = nil
+        permissions: any PermissionChecking = PermissionService(),
+        capture: any AudioCapturing = ScreenCaptureEngine(),
+        sleep: any SleepPreventing = SleepPreventionService(),
+        notifications: any RecordingNotifying = NotificationService(),
+        recoveryFactory: ((RecordingActivityGate, RecordingStore) -> RecoveryService)? = nil
     ) {
         self.settingsStore = settingsStore
         let settings = settingsStore.load()
         launchSettings = settings
-        let permissions = PermissionService()
         let activityGate = RecordingActivityGate()
         let recordingStore = RecordingStore(root: settings.recordingRoot)
-        let capture = ScreenCaptureEngine()
-        let sleep = SleepPreventionService()
-        let notifications = notificationService ?? NotificationService()
         let session = LiveRecordingSessionManager(
             activityGate: activityGate,
             store: recordingStore,
@@ -344,7 +342,20 @@ final class ProductionCompositionRoot {
             sleep: sleep,
             notifications: notifications
         )
-        let recovery = RecoveryService(activityGate: activityGate, store: recordingStore)
+        let recovery = recoveryFactory?(activityGate, recordingStore)
+            ?? RecoveryService(activityGate: activityGate, store: recordingStore)
+        let coordinator = RecordingCoordinator(session: session)
+        let permissionMessageRelay = PermissionMessageRelay()
+        let recordingAction = PermissionGatedRecordingAction(
+            permissions: permissions,
+            phase: { coordinator.phase },
+            toggle: { await coordinator.toggleRecording() },
+            updatePermissionMessage: permissionMessageRelay.publish
+        )
+        let recordingEntrypoint = RecordingActionEntrypoint(action: recordingAction)
+        let recordingHandler: @Sendable () -> Void = {
+            Task { @MainActor in await recordingEntrypoint.perform() }
+        }
 
         self.permissions = permissions
         self.activityGate = activityGate
@@ -354,29 +365,17 @@ final class ProductionCompositionRoot {
         self.notifications = notifications
         self.session = session
         self.recovery = recovery
-        coordinator = RecordingCoordinator(session: session)
+        self.coordinator = coordinator
         hotkey = HotkeyService()
         loginItem = LoginItemService()
+        self.recordingEntrypoint = recordingEntrypoint
+        menuRecordingHandler = recordingHandler
+        hotkeyRecordingHandler = recordingHandler
+        self.permissionMessageRelay = permissionMessageRelay
     }
 
-    func identitySnapshot(
-        action: PermissionGatedRecordingAction,
-        entrypoint: RecordingActionEntrypoint
-    ) -> ProductionCompositionIdentitySnapshot {
-        ProductionCompositionIdentitySnapshot(
-            permissionForAction: action.permissionServiceIdentity,
-            permissionForSession: ObjectIdentifier(permissions),
-            activityGateForSession: ObjectIdentifier(activityGate),
-            activityGateForRecovery: ObjectIdentifier(activityGate),
-            storeForSession: ObjectIdentifier(recordingStore),
-            storeForRecovery: ObjectIdentifier(recordingStore),
-            notificationForSession: ObjectIdentifier(notifications),
-            notificationHeldByApp: ObjectIdentifier(notifications),
-            buttonActionEntrypoint: ObjectIdentifier(entrypoint),
-            hotkeyActionEntrypoint: ObjectIdentifier(entrypoint),
-            launchRecordingRoot: launchSettings.recordingRoot,
-            storeRecordingRoot: launchSettings.recordingRoot
-        )
+    func bindPermissionMessageHandler(_ handler: @escaping (String?) -> Void) {
+        permissionMessageRelay.handler = handler
     }
 }
 
@@ -386,13 +385,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: RecordingCoordinator?
     private var menuModel: MenuBarViewModel?
     private var settingsModel: SettingsViewModel?
-    private var recordingAction: PermissionGatedRecordingAction?
     private var launchRecordingLocation: LaunchRecordingLocation?
     private var lifecycle: AppLifecycle?
 
     // Retaining the composition root also retains NotificationService's delegate for app lifetime.
     private var compositionRoot: ProductionCompositionRoot?
-    private var compositionIdentitySnapshot: ProductionCompositionIdentitySnapshot?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let composition = ProductionCompositionRoot()
@@ -406,34 +403,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hotkey = composition.hotkey
         let loginItem = composition.loginItem
 
-        weak var weakMenuModel: MenuBarViewModel?
-        let recordingAction = PermissionGatedRecordingAction(
-            permissions: permissions,
-            phase: { coordinator.phase },
-            toggle: { await coordinator.toggleRecording() },
-            updatePermissionMessage: { message in weakMenuModel?.permissionMessage = message }
-        )
-        let actionEntrypoint = RecordingActionEntrypoint(action: recordingAction)
-        let recordingHandler: @Sendable () -> Void = {
-            Task { @MainActor in await actionEntrypoint.perform() }
-        }
         let settingsModel = SettingsViewModel(
             initialSettings: settings,
             persistence: settingsStore,
             hotkey: hotkey,
             hotkeyTeardownError: { hotkey.lastTeardownError },
             loginItem: loginItem,
-            hotkeyAction: recordingHandler
+            hotkeyAction: composition.hotkeyRecordingHandler
         )
 
         let menuModel = MenuBarViewModel(
             coordinator: coordinator,
             recordingRoot: settings.recordingRoot,
-            onPrimaryAction: recordingHandler,
+            onPrimaryAction: composition.menuRecordingHandler,
             onOpenToday: { [weak self] in self?.openToday() },
             onShowSettings: { [weak self] in self?.showSettings() }
         )
-        weakMenuModel = menuModel
+        composition.bindPermissionMessageHandler { [weak menuModel] message in
+            menuModel?.permissionMessage = message
+        }
 
         let lifecycle = AppLifecycle(
             showMenu: { [menuBarController] in
@@ -451,14 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             recoveryRoot: settings.recordingRoot,
             recover: {
-                let results = await recovery.recoverInterruptedRecordings()
-                if let failure = await recovery.lastFailure {
-                    throw failure
-                }
-                if let failure = await recovery.lastBatchFailure {
-                    throw failure
-                }
-                return results
+                await recovery.recoverInterruptedRecordingsBatch()
             },
             notifyRecoveryResult: { result in
                 switch result.outcome {
@@ -477,7 +458,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             publishRecoveryFeedback: menuModel.publishRecoveryFeedback,
             registerHotkey: {
-                try hotkey.register(settingsModel.settings.hotkey, handler: recordingHandler)
+                try hotkey.register(
+                    settingsModel.settings.hotkey,
+                    handler: composition.hotkeyRecordingHandler
+                )
             },
             applyLoginItemSetting: {
                 try loginItem.setEnabled(settingsModel.settings.launchAtLogin)
@@ -491,21 +475,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             },
             phase: { coordinator.phase },
-            stopRecording: { await recordingAction.perform() },
+            stopRecording: { await composition.recordingEntrypoint.perform() },
             awaitSessionStop: { _ = try await session.stop() }
         )
 
         self.coordinator = coordinator
         self.settingsModel = settingsModel
         self.menuModel = menuModel
-        self.recordingAction = recordingAction
         launchRecordingLocation = LaunchRecordingLocation(root: settings.recordingRoot)
         self.lifecycle = lifecycle
         compositionRoot = composition
-        compositionIdentitySnapshot = composition.identitySnapshot(
-            action: recordingAction,
-            entrypoint: actionEntrypoint
-        )
         lifecycle.start()
 
         Task { [weak menuModel, weak lifecycle] in

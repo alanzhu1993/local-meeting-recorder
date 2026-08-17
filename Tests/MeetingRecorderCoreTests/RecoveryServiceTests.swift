@@ -52,9 +52,9 @@ final class RecoveryServiceTests: XCTestCase {
             finalizer: finalizer
         )
 
-        let first = Task { await service.recoverInterruptedRecordings() }
+        let first = Task { await service.recoverInterruptedRecordingsBatch() }
         await finalizer.waitUntilEntered()
-        let second = Task { await service.recoverInterruptedRecordings() }
+        let second = Task { await service.recoverInterruptedRecordingsBatch() }
         for _ in 0..<20 { await Task.yield() }
 
         let isRecovering = await service.isRecovering
@@ -65,9 +65,11 @@ final class RecoveryServiceTests: XCTestCase {
         XCTAssertEqual(callCount, 1)
 
         await gate.open()
-        let firstResults = await first.value
-        let secondResults = await second.value
-        XCTAssertEqual(firstResults, secondResults)
+        let firstBatch = await first.value
+        let secondBatch = await second.value
+        XCTAssertEqual(firstBatch, secondBatch)
+        XCTAssertEqual(firstBatch.results, [RecoveryResult(outcome: .recovered(output))])
+        XCTAssertNil(firstBatch.batchFailure)
         let isRecoveringAfterCompletion = await service.isRecovering
         let releasedURLs = await store.releasedURLs
         XCTAssertFalse(isRecoveringAfterCompletion)
@@ -202,6 +204,37 @@ final class RecoveryServiceTests: XCTestCase {
         XCTAssertEqual(callCount, 0)
     }
 
+    func testFailedBatchRemainsImmutableWhenNextBatchSucceedsBeforeFirstCallerConsumesIt() async {
+        let store = SequencedRecoveryStore(outcomes: [
+            .failure(RecordingFailure(code: .write, message: "batch one scan failed")),
+            .success([]),
+        ])
+        let service = RecoveryService(
+            activityGate: RecordingActivityGate(),
+            store: store,
+            finalizer: RecoveryFinalizerSpy()
+        )
+        let firstReturned = RecoverySignal()
+        let allowFirstConsumer = RecoveryAsyncGate()
+
+        let firstCaller = Task {
+            let batch = await service.recoverInterruptedRecordingsBatch()
+            firstReturned.signal()
+            await allowFirstConsumer.wait()
+            return batch
+        }
+        await firstReturned.wait()
+        let secondBatch = await service.recoverInterruptedRecordingsBatch()
+        await allowFirstConsumer.open()
+        let firstBatch = await firstCaller.value
+
+        XCTAssertEqual(firstBatch.results, [])
+        XCTAssertEqual(firstBatch.batchFailure?.code, .write)
+        XCTAssertEqual(firstBatch.batchFailure?.message, "batch one scan failed")
+        XCTAssertEqual(secondBatch.results, [])
+        XCTAssertNil(secondBatch.batchFailure)
+    }
+
     func testRecoveredURLFailureIsIsolatedAndDoesNotReleaseUnknownReservation() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -263,6 +296,25 @@ private actor RecoveryStoreSpy: InterruptedRecordingStoring {
     func releaseReservation(for outputURL: URL) async {
         releasedURLs.append(outputURL)
     }
+}
+
+private actor SequencedRecoveryStore: InterruptedRecordingStoring {
+    private var outcomes: [Result<[URL], RecordingFailure>]
+
+    init(outcomes: [Result<[URL], RecordingFailure>]) {
+        self.outcomes = outcomes
+    }
+
+    func listInterruptedRecordings() async throws -> [URL] {
+        guard !outcomes.isEmpty else { return [] }
+        return try outcomes.removeFirst().get()
+    }
+
+    func recoveredURL(for workingURL: URL) async throws -> URL {
+        throw RecordingFailure(code: .write, message: "unexpected recoveredURL call")
+    }
+
+    func releaseReservation(for outputURL: URL) async {}
 }
 
 private actor RecoveryFinalizerSpy: InterruptedRecordingFinalizing {
