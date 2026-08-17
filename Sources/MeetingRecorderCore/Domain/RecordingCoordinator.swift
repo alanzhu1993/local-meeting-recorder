@@ -9,6 +9,7 @@ public final class RecordingCoordinator: ObservableObject {
     private let session: any RecordingSessionManaging
     private let now: @Sendable () -> Date
     private var eventTask: Task<Void, Never>?
+    private var operationID = 0
 
     public init(
         session: any RecordingSessionManaging,
@@ -27,23 +28,39 @@ public final class RecordingCoordinator: ObservableObject {
     public func toggleRecording() async {
         switch phase {
         case .idle, .failed:
+            let operation = nextOperationID()
             phase = .preparing
             do {
-                phase = .recording(try await session.start(at: now()), warning: nil)
+                let active = try await session.start(at: now())
+                if operationID == operation, phase == .preparing {
+                    phase = .recording(active, warning: nil)
+                }
             } catch {
-                phase = .failed(Self.failure(from: error))
+                if operationID == operation, phase == .preparing {
+                    phase = .failed(Self.failure(from: error))
+                }
             }
         case let .recording(active, _):
+            let operation = nextOperationID()
             phase = .stopping(active)
             do {
                 _ = try await session.stop()
-                phase = .idle
+                if operationID == operation, phase == .stopping(active) {
+                    phase = .idle
+                }
             } catch {
-                phase = .failed(Self.failure(from: error))
+                if operationID == operation, phase == .stopping(active) {
+                    phase = .failed(Self.failure(from: error))
+                }
             }
         case .preparing, .stopping:
             return
         }
+    }
+
+    private func nextOperationID() -> Int {
+        operationID += 1
+        return operationID
     }
 
     private static func failure(from error: Error) -> RecordingFailure {
