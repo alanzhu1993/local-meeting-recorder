@@ -37,6 +37,49 @@ private struct DualCaptureArguments {
     }
 }
 
+private struct RecordUntilKilledArguments {
+    let workingURL: URL
+
+    init?(_ arguments: [String]) {
+        guard
+            arguments.count == 3,
+            arguments[0] == "record-until-killed",
+            arguments[1] == "--working",
+            !arguments[2].isEmpty
+        else {
+            return nil
+        }
+        workingURL = URL(fileURLWithPath: arguments[2])
+    }
+}
+
+private struct RecoverArguments {
+    let workingURL: URL
+    let outputURL: URL
+
+    init?(_ arguments: [String]) {
+        guard arguments.first == "recover" else { return nil }
+        var workingPath: String?
+        var outputPath: String?
+        var index = 1
+        while index < arguments.count {
+            switch arguments[index] {
+            case "--working" where index + 1 < arguments.count:
+                workingPath = arguments[index + 1]
+                index += 2
+            case "--output" where index + 1 < arguments.count:
+                outputPath = arguments[index + 1]
+                index += 2
+            default:
+                return nil
+            }
+        }
+        guard let workingPath, let outputPath else { return nil }
+        workingURL = URL(fileURLWithPath: workingPath)
+        outputURL = URL(fileURLWithPath: outputPath)
+    }
+}
+
 private actor ProbeMetrics {
     private var metrics = AudioCaptureProbeMetrics()
     private let stopped = AsyncStream<Void>.makeStream()
@@ -200,7 +243,186 @@ private func writeReport(_ text: String, to url: URL) throws {
     try text.write(to: url, atomically: true, encoding: .utf8)
 }
 
+private func sineChunk(startFrame: Int64, frameCount: Int) -> MixedAudioChunk {
+    let frequency = 440.0
+    let amplitude = Float(0.25)
+    let sampleRate = 48_000.0
+    let samples = (0..<frameCount).flatMap { offset -> [Float] in
+        let frame = startFrame + Int64(offset)
+        let value = amplitude * Float(
+            sin(2 * Double.pi * frequency * Double(frame) / sampleRate)
+        )
+        return [value, value]
+    }
+    return MixedAudioChunk(
+        startFrame: startFrame,
+        frameCount: frameCount,
+        samples: samples
+    )
+}
+
+private func runUntilKilled(_ arguments: RecordUntilKilledArguments) async throws -> Never {
+    let writer = FragmentedMOVWriter(workingURL: arguments.workingURL)
+    try await writer.start()
+    print("ready pid=\(ProcessInfo.processInfo.processIdentifier) signal=TERM")
+    fflush(stdout)
+
+    let framesPerChunk = 960
+    var startFrame: Int64 = 0
+    while true {
+        try await writer.append(
+            sineChunk(startFrame: startFrame, frameCount: framesPerChunk)
+        )
+        startFrame += Int64(framesPerChunk)
+        if startFrame % 48_000 == 0 {
+            print("writtenFrames=\(startFrame) seconds=\(startFrame / 48_000)")
+            fflush(stdout)
+        }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}
+
+private struct AudioFileProbeResult {
+    let durationSeconds: Double
+    let audioTrackCount: Int
+    let hasAACTrack: Bool
+    let playable: Bool
+    let peakAmplitude: Float
+
+    var passedRecoveryChecks: Bool {
+        durationSeconds >= 10
+            && audioTrackCount == 1
+            && hasAACTrack
+            && playable
+            && peakAmplitude > 0.001
+    }
+}
+
+private func inspectRecoveredAudio(_ url: URL) async throws -> AudioFileProbeResult {
+    let asset = AVURLAsset(url: url)
+    let duration = try await asset.load(.duration)
+    let playable = try await asset.load(.isPlayable)
+    let tracks = try await asset.loadTracks(withMediaType: .audio)
+    var hasAACTrack = false
+    for track in tracks {
+        let descriptions = try await track.load(.formatDescriptions)
+        if descriptions.contains(where: {
+            CMFormatDescriptionGetMediaSubType($0) == kAudioFormatMPEG4AAC
+        }) {
+            hasAACTrack = true
+        }
+    }
+
+    var peak = Float.zero
+    if let track = tracks.first {
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsNonInterleaved: false,
+            ]
+        )
+        guard reader.canAdd(output) else {
+            throw RecordingFailure(code: .finalize, message: "AVAssetReader rejected the recovered audio track.")
+        }
+        reader.add(output)
+        guard reader.startReading() else {
+            throw RecordingFailure(
+                code: .finalize,
+                message: "Could not decode recovered audio: \(reader.error?.localizedDescription ?? "unknown reader error")"
+            )
+        }
+        while let sampleBuffer = output.copyNextSampleBuffer() {
+            guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { continue }
+            let byteCount = CMBlockBufferGetDataLength(blockBuffer)
+            guard byteCount >= MemoryLayout<Float>.size else { continue }
+            var bytes = Data(count: byteCount)
+            let status = bytes.withUnsafeMutableBytes { destination in
+                CMBlockBufferCopyDataBytes(
+                    blockBuffer,
+                    atOffset: 0,
+                    dataLength: byteCount,
+                    destination: destination.baseAddress!
+                )
+            }
+            guard status == kCMBlockBufferNoErr else { continue }
+            bytes.withUnsafeBytes { rawBytes in
+                let values = rawBytes.bindMemory(to: Float.self)
+                for value in values {
+                    peak = max(peak, abs(value))
+                }
+            }
+        }
+        guard reader.status == .completed else {
+            throw RecordingFailure(
+                code: .finalize,
+                message: "Recovered audio decoding did not complete: \(reader.error?.localizedDescription ?? "unknown reader error")"
+            )
+        }
+    }
+
+    return AudioFileProbeResult(
+        durationSeconds: CMTimeGetSeconds(duration),
+        audioTrackCount: tracks.count,
+        hasAACTrack: hasAACTrack,
+        playable: playable,
+        peakAmplitude: peak
+    )
+}
+
+private func runRecovery(_ arguments: RecoverArguments) async throws -> AudioFileProbeResult {
+    _ = try await M4AFinalizer().recover(
+        workingURL: arguments.workingURL,
+        recoveredURL: arguments.outputURL
+    )
+    return try await inspectRecoveredAudio(arguments.outputURL)
+}
+
 let arguments = Array(CommandLine.arguments.dropFirst())
+if arguments.first == "record-until-killed" {
+    guard let recordArguments = RecordUntilKilledArguments(arguments) else {
+        FileHandle.standardError.write(Data(
+            "Usage: RecorderProbe record-until-killed --working PATH\n".utf8
+        ))
+        exit(64)
+    }
+    do {
+        try await runUntilKilled(recordArguments)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "record-until-killed failed: \(error.localizedDescription)\n".utf8
+        ))
+        exit(74)
+    }
+}
+
+if arguments.first == "recover" {
+    guard let recoverArguments = RecoverArguments(arguments) else {
+        FileHandle.standardError.write(Data(
+            "Usage: RecorderProbe recover --working PATH --output PATH\n".utf8
+        ))
+        exit(64)
+    }
+    do {
+        let result = try await runRecovery(recoverArguments)
+        print(String(format: "durationSeconds=%.6f", result.durationSeconds))
+        print("audioTracks=\(result.audioTrackCount)")
+        print("aacTrack=\(result.hasAACTrack)")
+        print("playable=\(result.playable)")
+        print(String(format: "peakAmplitude=%.6f", result.peakAmplitude))
+        print("result=\(result.passedRecoveryChecks ? "PASS" : "NOT_PASSED")")
+        exit(result.passedRecoveryChecks ? 0 : 2)
+    } catch {
+        FileHandle.standardError.write(Data(
+            "recover failed: \(error.localizedDescription)\n".utf8
+        ))
+        exit(74)
+    }
+}
+
 if arguments.first == "dual-capture" {
     guard let dualCaptureArguments = DualCaptureArguments(arguments) else {
         FileHandle.standardError.write(Data(

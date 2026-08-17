@@ -13,6 +13,11 @@ let package = Package(
         .target(name: "MeetingRecorderCore"),
         .executableTarget(name: "MeetingRecorderApp", dependencies: ["MeetingRecorderCore"]),
         .executableTarget(name: "RecorderProbe", dependencies: ["MeetingRecorderCore"]),
-        .testTarget(name: "MeetingRecorderCoreTests", dependencies: ["MeetingRecorderCore"]),
+        .testTarget(
+            name: "MeetingRecorderCoreTests",
+            dependencies: ["MeetingRecorderCore"],
+            path: "Tests",
+            sources: ["MeetingRecorderCoreTests", "TestSupport"]
+        ),
     ]
 )
