@@ -6,25 +6,16 @@ import XCTest
 @MainActor
 final class AppLifecycleTests: XCTestCase {
     func testProductionCompositionRecordingLeaseBlocksRootRecoveryAndUsesLaunchStore() async throws {
-        let rootURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: rootURL) }
-        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
-        AppSettingsStore(defaults: defaults).save(AppSettings(
-            recordingRoot: rootURL,
-            hotkey: .init(keyCode: 15, modifiers: 0x1800, displayText: "⌘R"),
-            launchAtLogin: false
-        ))
+        let environment = try makeCompositionTestEnvironment()
+        defer { environment.cleanup() }
         let capture = CompositionBlockingCapture()
         let composition = ProductionCompositionRoot(
-            settingsStore: AppSettingsStore(defaults: defaults),
-            permissions: CompositionPermissionSpy(status: CapturePermissionStatus(missing: [])),
+            settingsStore: environment.settingsStore,
+            permissions: CompositionPermissionSpy(statuses: [.granted]),
             capture: capture,
             sleep: CompositionSleepSpy(),
             notifications: CompositionNotificationSpy(),
+            sessionFactory: makeCompositionTestSession,
             recoveryFactory: { activityGate, store in
                 RecoveryService(
                     activityGate: activityGate,
@@ -38,19 +29,19 @@ final class AppLifecycleTests: XCTestCase {
         await capture.waitUntilStartEntered()
         let blockedRecovery = await composition.recovery.recoverInterruptedRecordingsBatch()
         let workingFiles = (FileManager.default.enumerator(
-            at: rootURL,
+            at: environment.rootURL,
             includingPropertiesForKeys: nil
         )?.allObjects as? [URL] ?? []).filter {
             $0.lastPathComponent.contains("inprogress")
         }
-        let canonicalRootPath = rootURL.path.hasPrefix("/var/")
-            ? "/private\(rootURL.path)"
-            : rootURL.path
+        let canonicalRootPath = canonicalCompositionPath(environment.rootURL)
 
         XCTAssertEqual(blockedRecovery.batchFailure?.code, .capture)
         XCTAssertTrue(blockedRecovery.batchFailure?.message.contains("录音正在进行") == true)
         XCTAssertEqual(workingFiles.count, 1)
-        XCTAssertTrue(workingFiles[0].path.hasPrefix(canonicalRootPath + "/"))
+        XCTAssertTrue(
+            canonicalCompositionPath(workingFiles[0]).hasPrefix(canonicalRootPath + "/")
+        )
 
         _ = try? await composition.session.stop()
         _ = try? await start.value
@@ -62,26 +53,30 @@ final class AppLifecycleTests: XCTestCase {
         case let .recovered(url): recoveredPath = url.path
         case let .failed(url, _): recoveredPath = url.path
         }
-        XCTAssertTrue(recoveredPath.hasPrefix(canonicalRootPath + "/"))
+        let canonicalRecoveredPath = canonicalCompositionPath(URL(fileURLWithPath: recoveredPath))
+        XCTAssertTrue(
+            canonicalRecoveredPath.hasPrefix(canonicalRootPath + "/"),
+            "Expected \(canonicalRecoveredPath) inside \(canonicalRootPath)."
+        )
     }
 
-    func testProductionCompositionRecoveryLeaseBlocksRootSession() async {
-        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+    func testProductionCompositionRecoveryLeaseBlocksRootSession() async throws {
+        let environment = try makeCompositionTestEnvironment()
+        defer { environment.cleanup() }
         let recoveryEntered = CompositionSignal()
         let releaseRecovery = LifecycleAsyncGate()
         let composition = ProductionCompositionRoot(
-            settingsStore: AppSettingsStore(defaults: defaults),
-            permissions: CompositionPermissionSpy(status: CapturePermissionStatus(missing: [])),
+            settingsStore: environment.settingsStore,
+            permissions: CompositionPermissionSpy(statuses: [.granted]),
             capture: CompositionBlockingCapture(),
             sleep: CompositionSleepSpy(),
             notifications: CompositionNotificationSpy(),
+            sessionFactory: makeCompositionTestSession,
             recoveryFactory: { activityGate, store in
                 RecoveryService(
                     activityGate: activityGate,
                     store: store,
-                    finalizer: M4AFinalizer(),
+                    finalizer: LifecycleRecoveryFinalizerSpy(),
                     afterLeaseAcquired: {
                         recoveryEntered.signal()
                         await releaseRecovery.wait()
@@ -105,31 +100,98 @@ final class AppLifecycleTests: XCTestCase {
         _ = await recovery.value
     }
 
-    func testProductionMenuAndHotkeyHandlersUseInjectedPermissionService() async {
-        let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+    func testProductionMenuAndHotkeyShareOneInFlightPermissionRequestAndSafelyStopSession() async throws {
+        let environment = try makeCompositionTestEnvironment()
+        defer { environment.cleanup() }
         let permissions = CompositionPermissionSpy(
-            status: CapturePermissionStatus(missing: [.systemAudio])
+            statuses: [.denied, .granted, .granted],
+            suspendRequest: true
         )
+        let capture = CompositionBlockingCapture(suspendStart: false)
         let composition = ProductionCompositionRoot(
-            settingsStore: AppSettingsStore(defaults: defaults),
+            settingsStore: environment.settingsStore,
             permissions: permissions,
-            capture: CompositionBlockingCapture(),
+            capture: capture,
             sleep: CompositionSleepSpy(),
-            notifications: CompositionNotificationSpy()
+            notifications: CompositionNotificationSpy(),
+            sessionFactory: makeCompositionTestSession,
+            recoveryFactory: makeCompositionTestRecovery
         )
 
         composition.menuRecordingHandler()
-        await permissions.waitForRequestCount(1)
-        await permissions.waitForCurrentCount(2)
+        let menuRequestStarted = await permissions.waitForRequestCount(1)
+        XCTAssertTrue(menuRequestStarted)
         composition.hotkeyRecordingHandler()
-        await permissions.waitForRequestCount(2)
-        await permissions.waitForCurrentCount(4)
+        for _ in 0..<100 { await Task.yield() }
 
-        let counts = await permissions.counts
-        XCTAssertEqual(counts.current, 4)
-        XCTAssertEqual(counts.request, 2)
+        var snapshot = await permissions.snapshot
+        XCTAssertEqual(snapshot.currentCount, 1)
+        XCTAssertEqual(snapshot.requestCount, 1)
+
+        await permissions.releaseRequest()
+        let menuRequestFinished = await permissions.waitForCurrentCount(3)
+        XCTAssertTrue(menuRequestFinished)
+        await capture.waitUntilStartEntered()
+        let recordingStarted = await waitForCompositionPhase(composition.coordinator) {
+            if case .recording = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(recordingStarted)
+
+        snapshot = await permissions.snapshot
+        XCTAssertEqual(snapshot.currentCount, 3)
+        XCTAssertEqual(snapshot.requestCount, 1)
+        await composition.recordingEntrypoint.perform()
+        guard case .idle = composition.coordinator.phase else {
+            return XCTFail("The shared session must stop cleanly after the suspended request is released.")
+        }
+        let remainingFiles = try FileManager.default.contentsOfDirectory(
+            at: environment.rootURL,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(remainingFiles.contains { $0.lastPathComponent.contains("inprogress") })
+    }
+
+    func testProductionSessionRechecksTheSameInjectedPermissionBeforePreparingCapture() async throws {
+        let environment = try makeCompositionTestEnvironment()
+        defer { environment.cleanup() }
+        let permissions = CompositionPermissionSpy(
+            statuses: [.denied, .granted, .denied]
+        )
+        let capture = CompositionBlockingCapture()
+        let composition = ProductionCompositionRoot(
+            settingsStore: environment.settingsStore,
+            permissions: permissions,
+            capture: capture,
+            sleep: CompositionSleepSpy(),
+            notifications: CompositionNotificationSpy(),
+            sessionFactory: makeCompositionTestSession,
+            recoveryFactory: makeCompositionTestRecovery
+        )
+
+        composition.menuRecordingHandler()
+        let sessionCheckObserved = await permissions.waitForCurrentCount(3)
+        XCTAssertTrue(sessionCheckObserved)
+        for _ in 0..<10 { await Task.yield() }
+
+        let snapshot = await permissions.snapshot
+        XCTAssertEqual(snapshot.requestCount, 1)
+        XCTAssertEqual(
+            snapshot.events,
+            [
+                "current.1.denied",
+                "request.1.started",
+                "request.1.finished",
+                "current.2.granted",
+                "current.3.denied",
+            ]
+        )
+        let captureStartCallCount = await capture.startCallCount
+        XCTAssertEqual(captureStartCallCount, 0)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(
+            at: environment.rootURL,
+            includingPropertiesForKeys: nil
+        ).isEmpty)
     }
 
     func testLaunchRecoversBeforeEnablingHotkey() async {
@@ -395,6 +457,120 @@ final class AppLifecycleTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.finalURL.path))
         XCTAssertEqual(harness.replyCount, 1)
     }
+}
+
+private struct CompositionTestEnvironment {
+    let rootURL: URL
+    let suiteName: String
+    let defaults: UserDefaults
+    let settingsStore: AppSettingsStore
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: rootURL)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+}
+
+private func makeCompositionTestEnvironment() throws -> CompositionTestEnvironment {
+    let temporaryDirectory = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+    let rootURL = temporaryDirectory
+        .appendingPathComponent("MeetingRecorderCompositionTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+    let suiteName = "MeetingRecorderCompositionTests.\(UUID().uuidString)"
+    guard let defaults = UserDefaults(suiteName: suiteName) else {
+        throw CompositionTestEnvironmentError.cannotCreateDefaults
+    }
+    let settingsStore = AppSettingsStore(defaults: defaults)
+    settingsStore.save(AppSettings(
+        recordingRoot: rootURL,
+        hotkey: .init(keyCode: 15, modifiers: 0x1800, displayText: "⌘R"),
+        launchAtLogin: false
+    ))
+
+    let canonicalRoot = rootURL.resolvingSymlinksInPath().standardizedFileURL
+    let canonicalTemporaryDirectory = temporaryDirectory.standardizedFileURL
+    let canonicalDefaultRoot = AppMetadata.defaultRecordingRoot
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+    XCTAssertTrue(canonicalRoot.path.hasPrefix(canonicalTemporaryDirectory.path + "/"))
+    XCTAssertNotEqual(canonicalRoot.path, canonicalDefaultRoot.path)
+    XCTAssertEqual(
+        settingsStore.load().recordingRoot.resolvingSymlinksInPath().standardizedFileURL.path,
+        canonicalRoot.path
+    )
+
+    return CompositionTestEnvironment(
+        rootURL: rootURL,
+        suiteName: suiteName,
+        defaults: defaults,
+        settingsStore: settingsStore
+    )
+}
+
+private enum CompositionTestEnvironmentError: Error {
+    case cannotCreateDefaults
+}
+
+private func canonicalCompositionPath(_ url: URL) -> String {
+    let path = url.standardizedFileURL.path
+    return path.hasPrefix("/var/") ? "/private\(path)" : path
+}
+
+@MainActor
+private func waitForCompositionPhase(
+    _ coordinator: RecordingCoordinator,
+    matches: (RecordingPhase) -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + .seconds(2)
+    while !matches(coordinator.phase) {
+        guard clock.now < deadline else { return false }
+        await Task.yield()
+    }
+    return true
+}
+
+private func makeCompositionTestSession(
+    activityGate: RecordingActivityGate,
+    store: RecordingStore,
+    capture: any AudioCapturing,
+    permissions: any PermissionChecking,
+    sleep: any SleepPreventing,
+    notifications: any RecordingNotifying
+) -> LiveRecordingSessionManager {
+    LiveRecordingSessionManager(
+        activityGate: activityGate,
+        store: store,
+        capture: capture,
+        permissions: permissions,
+        sleep: sleep,
+        notifications: notifications,
+        writerFactory: {
+            LifecycleWriterSpy(workingURL: $0, finishGate: nil, finishError: nil)
+        },
+        converterFactory: { SampleBufferConverter() },
+        mixerFactory: {
+            AudioTimelineMixer(sampleRate: 48_000, channels: 2, chunkFrames: 960)
+        },
+        now: Date.init,
+        sampleQueueCapacity: 8
+    )
+}
+
+private func makeCompositionTestRecovery(
+    activityGate: RecordingActivityGate,
+    store: RecordingStore
+) -> RecoveryService {
+    RecoveryService(
+        activityGate: activityGate,
+        store: store,
+        finalizer: LifecycleRecoveryFinalizerSpy()
+    )
+}
+
+private extension CapturePermissionStatus {
+    static let granted = CapturePermissionStatus(missing: [])
+    static let denied = CapturePermissionStatus(missing: [.systemAudio])
 }
 
 final class InstallScriptIntegrationTests: XCTestCase {
@@ -839,43 +1015,81 @@ private actor LifecycleNotificationSpy: RecordingNotifying {
 }
 
 private actor CompositionPermissionSpy: PermissionChecking {
-    private let status: CapturePermissionStatus
+    struct Snapshot: Sendable {
+        let currentCount: Int
+        let requestCount: Int
+        let events: [String]
+    }
+
+    private let statuses: [CapturePermissionStatus]
+    private let requestGate: LifecycleAsyncGate?
     private var currentCount = 0
     private var requestCount = 0
+    private var events: [String] = []
 
-    init(status: CapturePermissionStatus) {
-        self.status = status
+    init(statuses: [CapturePermissionStatus], suspendRequest: Bool = false) {
+        precondition(!statuses.isEmpty)
+        self.statuses = statuses
+        requestGate = suspendRequest ? LifecycleAsyncGate() : nil
     }
 
     func currentStatus() async -> CapturePermissionStatus {
         currentCount += 1
+        let status = statuses[min(currentCount - 1, statuses.count - 1)]
+        events.append("current.\(currentCount).\(status.isGranted ? "granted" : "denied")")
         return status
     }
 
     func requestMissingPermissions() async -> CapturePermissionStatus {
         requestCount += 1
-        return status
+        let requestNumber = requestCount
+        events.append("request.\(requestNumber).started")
+        await requestGate?.wait()
+        events.append("request.\(requestNumber).finished")
+        return statuses[min(currentCount, statuses.count - 1)]
     }
 
-    var counts: (current: Int, request: Int) {
-        (currentCount, requestCount)
+    var snapshot: Snapshot {
+        Snapshot(currentCount: currentCount, requestCount: requestCount, events: events)
     }
 
-    func waitForRequestCount(_ expected: Int) async {
-        while requestCount < expected { await Task.yield() }
+    func releaseRequest() async {
+        await requestGate?.open()
     }
 
-    func waitForCurrentCount(_ expected: Int) async {
-        while currentCount < expected { await Task.yield() }
+    func waitForRequestCount(_ expected: Int) async -> Bool {
+        await waitUntil { self.requestCount >= expected }
+    }
+
+    func waitForCurrentCount(_ expected: Int) async -> Bool {
+        await waitUntil { self.currentCount >= expected }
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(2)
+        while !condition() {
+            guard clock.now < deadline else { return false }
+            await Task.yield()
+        }
+        return true
     }
 }
 
 private actor CompositionBlockingCapture: AudioCapturing {
     private let gate = LifecycleAsyncGate()
+    private let suspendStart: Bool
     private var startEntered = false
+    private(set) var startCallCount = 0
+
+    init(suspendStart: Bool = true) {
+        self.suspendStart = suspendStart
+    }
 
     func start(eventHandler: @escaping @Sendable (AudioCaptureEvent) async -> Void) async throws {
+        startCallCount += 1
         startEntered = true
+        guard suspendStart else { return }
         await gate.wait()
         throw CancellationError()
     }

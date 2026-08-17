@@ -102,3 +102,29 @@
 - Release build 成功；产物为 arm64 Mach-O，ad-hoc 签名，`codesign --verify --deep --strict` 通过，bundle id 为 `com.alan.local-meeting-recorder`，`LSUIElement=true`。
 - `zsh -n scripts/install-local.sh` 和 `git diff --check` 通过。
 - 按 FixRound2 要求，本轮没有运行真实安装，没有停止进程，没有移动 `/Users/alan/Applications/会议录音.app`。
+
+## FixRound3 追加（2026-08-18）
+
+### Composition 测试目录隔离
+
+- 所有 `ProductionCompositionRoot` 行为测试现在都先在 `FileManager.default.temporaryDirectory` 下创建唯一录音根目录，再用独立 `UserDefaults` suite 的 `AppSettingsStore` 保存该目录，最后才构造 root。
+- 公共测试 helper 会断言规范化后的录音根目录确实位于临时目录内，并且不等于 `AppMetadata.defaultRecordingRoot`；测试结束只删除本用例创建的精确目录和独立 defaults domain。
+- 每个 root 行为测试都注入 test capture、test writer 和 test recovery finalizer。新增的最小 `sessionFactory` 注入点只替换测试 session；生产 `AppDelegate` 仍调用 `ProductionCompositionRoot()` 的同一个默认路径，继续使用真实 writer/converter/mixer。
+- 录音 lease / recovery lease 双向互斥测试、session working file 与 recovery 共用 launch store 测试均在上述临时根目录内运行，不扫描或恢复默认真实录音目录。
+
+### 共享权限入口行为强化
+
+- 并发测试先让 menu action 的权限请求挂起，再触发 hotkey。挂起期间同一 spy 只记录 1 次 status check 和 1 次 permission request，证明两个入口共享同一个 `RecordingActionEntrypoint` 及其 `requestInFlight` 状态；如果是两个独立 action，该断言会观察到第 2 次 request 并失败。
+- 放行权限请求后，真实 `LiveRecordingSessionManager` 使用 test writer/capture 启动；测试随后经同一录音入口停止 session，并断言没有遗留 in-progress working file。
+- 分阶段权限测试让同一 spy 依次返回 denied、granted、denied：action 层完成检查、请求和复查后放行，session 层的下一次检查拒绝。事件序列精确为 `current.1.denied → request.1.started → request.1.finished → current.2.granted → current.3.denied`，同时 capture start 调用数为 0，临时录音根目录为空。这证明 action 和真实 session 实际消费 root 注入的同一权限实例，并且 session 在 prepare/capture 前再次检查权限。
+
+### FixRound3 TDD 和验证证据
+
+- 新测试先因 `ProductionCompositionRoot` 没有 `sessionFactory` 参数编译失败；补充最小注入点后转绿。未改变生产默认依赖或启动路径。
+- `AppLifecycleTests`：17 项通过；关键 store/recovery 用例额外连续重复运行 5 次均通过。
+- `RecoveryServiceTests`：8 项通过。
+- `InstallScriptIntegrationTests`：7 项通过，仍全部在测试专用临时目录中运行。
+- 全量 `swift test -Xswiftc -warnings-as-errors`：184 项，0 失败，1 项截图用例按环境跳过。
+- Release app 构建成功；可执行文件为 arm64 Mach-O，ad-hoc 签名，`codesign --verify --deep --strict` 通过，bundle id 为 `com.alan.local-meeting-recorder`，`LSUIElement=true`。
+- `zsh -n scripts/install-local.sh` 和 `git diff --check` 通过。
+- 按 FixRound3 要求，本轮没有运行真实安装，没有停止进程，没有移动 `/Users/alan/Applications/会议录音.app`；只读复核 target 仍为 inode `126288769`、mtime `1786985951`，与 FixRound2 前一致，且没有匹配该精确 executable path 的运行进程。

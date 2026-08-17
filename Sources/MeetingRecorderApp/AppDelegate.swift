@@ -327,6 +327,14 @@ final class ProductionCompositionRoot {
         capture: any AudioCapturing = ScreenCaptureEngine(),
         sleep: any SleepPreventing = SleepPreventionService(),
         notifications: any RecordingNotifying = NotificationService(),
+        sessionFactory: ((
+            RecordingActivityGate,
+            RecordingStore,
+            any AudioCapturing,
+            any PermissionChecking,
+            any SleepPreventing,
+            any RecordingNotifying
+        ) -> LiveRecordingSessionManager)? = nil,
         recoveryFactory: ((RecordingActivityGate, RecordingStore) -> RecoveryService)? = nil
     ) {
         self.settingsStore = settingsStore
@@ -334,7 +342,14 @@ final class ProductionCompositionRoot {
         launchSettings = settings
         let activityGate = RecordingActivityGate()
         let recordingStore = RecordingStore(root: settings.recordingRoot)
-        let session = LiveRecordingSessionManager(
+        let session = sessionFactory?(
+            activityGate,
+            recordingStore,
+            capture,
+            permissions,
+            sleep,
+            notifications
+        ) ?? LiveRecordingSessionManager(
             activityGate: activityGate,
             store: recordingStore,
             capture: capture,
