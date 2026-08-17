@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import XCTest
 @testable import MeetingRecorderCore
@@ -72,6 +73,46 @@ final class RecordingStoreTests: XCTestCase {
             Set(["会议录音-2026-08-17-23-59-59.m4a", "会议录音-2026-08-17-23-59-59-2.m4a"])
         )
         XCTAssertNotEqual(firstPaths.workingURL, secondPaths.workingURL)
+    }
+
+    func testPublishedReservationIsLockedBeforeAnotherStoreCanReclaimIt() async throws {
+        let root = makeTemporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let published = DispatchSemaphore(value: 0)
+        let continueFirstStore = DispatchSemaphore(value: 0)
+        let secondCompleted = DispatchSemaphore(value: 0)
+        let timeZone = TimeZone(secondsFromGMT: 28_800)!
+        let start = ISO8601DateFormatter().date(from: "2026-08-17T23:59:59+08:00")!
+        let firstStore = RecordingStore(
+            root: root,
+            timeZone: timeZone,
+            availableCapacity: { 2_000_000_000 },
+            reservationPublishedHook: {
+                published.signal()
+                _ = continueFirstStore.wait(timeout: .now() + 2)
+            }
+        )
+        let secondStore = RecordingStore(root: root, timeZone: timeZone, availableCapacity: { 2_000_000_000 })
+
+        let firstTask = Task { try await firstStore.prepare(startedAt: start) }
+        XCTAssertEqual(published.wait(timeout: .now() + 2), .success)
+
+        let secondTask = Task {
+            let paths = try await secondStore.prepare(startedAt: start)
+            secondCompleted.signal()
+            return paths
+        }
+        XCTAssertEqual(secondCompleted.wait(timeout: .now() + 2), .success)
+        continueFirstStore.signal()
+
+        let firstPaths = try await firstTask.value
+        let secondPaths = try await secondTask.value
+        XCTAssertEqual(
+            Set([firstPaths.finalURL.lastPathComponent, secondPaths.finalURL.lastPathComponent]),
+            Set(["会议录音-2026-08-17-23-59-59.m4a", "会议录音-2026-08-17-23-59-59-2.m4a"])
+        )
+        await firstStore.releaseReservation(for: firstPaths.finalURL)
+        await secondStore.releaseReservation(for: secondPaths.finalURL)
     }
 
     func testPrepareMapsDirectoryCreationFailureToWriteFailure() async throws {

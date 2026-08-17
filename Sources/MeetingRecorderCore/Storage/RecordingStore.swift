@@ -29,6 +29,7 @@ public actor RecordingStore {
     private let root: URL
     private let timeZone: TimeZone
     private let availableCapacity: @Sendable () -> Int64
+    private let reservationPublishedHook: (@Sendable () -> Void)?
     private var reservationDescriptors: [URL: Int32] = [:]
 
     public init(
@@ -38,6 +39,7 @@ public actor RecordingStore {
     ) {
         self.root = root
         self.timeZone = timeZone
+        self.reservationPublishedHook = nil
         if let availableCapacity {
             self.availableCapacity = availableCapacity
         } else {
@@ -45,6 +47,18 @@ public actor RecordingStore {
                 Self.systemAvailableCapacity(for: root)
             }
         }
+    }
+
+    init(
+        root: URL,
+        timeZone: TimeZone,
+        availableCapacity: @escaping @Sendable () -> Int64,
+        reservationPublishedHook: @escaping @Sendable () -> Void
+    ) {
+        self.root = root
+        self.timeZone = timeZone
+        self.availableCapacity = availableCapacity
+        self.reservationPublishedHook = reservationPublishedHook
     }
 
     deinit {
@@ -122,7 +136,7 @@ public actor RecordingStore {
         guard let descriptor = reservationDescriptors.removeValue(forKey: outputURL) else {
             return
         }
-        try? FileManager.default.removeItem(at: reservationURL(for: outputURL))
+        removeReservationIfOwned(reservationURL(for: outputURL), descriptor: descriptor)
         _ = flock(descriptor, LOCK_UN)
         _ = close(descriptor)
     }
@@ -203,20 +217,34 @@ public actor RecordingStore {
 
     private func reserve(_ outputURL: URL) throws -> ReservationResult {
         let reservationURL = reservationURL(for: outputURL)
-        let descriptor = reservationURL.path.withCString {
-            open($0, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        let (temporaryURL, descriptor) = try createTemporaryReservation(near: reservationURL)
+
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            let errorCode = errno
+            removeFile(at: temporaryURL)
+            _ = close(descriptor)
+            throw reservationFailure(errorCode)
         }
-        if descriptor != -1 {
-            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-                let errorCode = errno
-                _ = close(descriptor)
-                throw reservationFailure(errorCode)
+
+        let linkResult = temporaryURL.path.withCString { temporaryPath in
+            reservationURL.path.withCString { reservationPath in
+                link(temporaryPath, reservationPath)
             }
+        }
+        if linkResult == 0 {
             reservationDescriptors[outputURL] = descriptor
+            reservationPublishedHook?()
+            guard removeFile(at: temporaryURL) else {
+                releaseReservation(for: outputURL)
+                throw RecordingFailure(code: .write, message: "无法完成录音文件预留。")
+            }
             return .reserved
         }
 
         let errorCode = errno
+        removeFile(at: temporaryURL)
+        _ = flock(descriptor, LOCK_UN)
+        _ = close(descriptor)
         guard errorCode == EEXIST else {
             throw reservationFailure(errorCode)
         }
@@ -224,7 +252,7 @@ public actor RecordingStore {
     }
 
     private func reclaimIfStale(_ reservationURL: URL) throws -> ReservationResult {
-        let descriptor = reservationURL.path.withCString { open($0, O_RDWR) }
+        let descriptor = reservationURL.path.withCString { open($0, O_RDWR | O_NOFOLLOW) }
         guard descriptor != -1 else {
             let errorCode = errno
             if errorCode == ENOENT {
@@ -246,10 +274,11 @@ public actor RecordingStore {
             _ = flock(descriptor, LOCK_UN)
             _ = close(descriptor)
         }
-        do {
-            try FileManager.default.removeItem(at: reservationURL)
-        } catch {
-            throw RecordingFailure(code: .write, message: "无法清理过期预留：\(error.localizedDescription)")
+        guard reservationMatchesDescriptor(reservationURL, descriptor: descriptor) else {
+            return .reclaimed
+        }
+        guard removeFile(at: reservationURL) else {
+            throw RecordingFailure(code: .write, message: "无法清理过期预留。")
         }
         return .reclaimed
     }
@@ -263,6 +292,49 @@ public actor RecordingStore {
         let base = outputURL.deletingPathExtension().lastPathComponent
         return outputURL.deletingLastPathComponent()
             .appendingPathComponent(".\(base).reservation")
+    }
+
+    private func createTemporaryReservation(near reservationURL: URL) throws -> (URL, Int32) {
+        for _ in 0..<10 {
+            let candidate = reservationURL.deletingLastPathComponent().appendingPathComponent(
+                "\(reservationURL.lastPathComponent).\(UUID().uuidString).tmp"
+            )
+            let descriptor = candidate.path.withCString {
+                open($0, O_RDWR | O_CREAT | O_EXCL, 0o600)
+            }
+            if descriptor != -1 {
+                return (candidate, descriptor)
+            }
+            if errno != EEXIST {
+                throw reservationFailure(errno)
+            }
+        }
+        throw RecordingFailure(code: .write, message: "无法创建录音文件预留。")
+    }
+
+    private func removeReservationIfOwned(_ reservationURL: URL, descriptor: Int32) {
+        guard reservationMatchesDescriptor(reservationURL, descriptor: descriptor) else {
+            return
+        }
+        _ = removeFile(at: reservationURL)
+    }
+
+    private func reservationMatchesDescriptor(_ reservationURL: URL, descriptor: Int32) -> Bool {
+        var descriptorStatus = stat()
+        guard fstat(descriptor, &descriptorStatus) == 0 else {
+            return false
+        }
+        var pathStatus = stat()
+        let result = reservationURL.path.withCString { lstat($0, &pathStatus) }
+        guard result == 0 else {
+            return false
+        }
+        return descriptorStatus.st_dev == pathStatus.st_dev && descriptorStatus.st_ino == pathStatus.st_ino
+    }
+
+    @discardableResult
+    private func removeFile(at url: URL) -> Bool {
+        url.path.withCString { unlink($0) == 0 }
     }
 
     private func workingFileBase(for workingURL: URL) throws -> String {
