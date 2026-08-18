@@ -10,25 +10,28 @@ final class AppLifecycleTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let buildPath = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: buildPath) }
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting-recorder-build-test.\(UUID().uuidString)", isDirectory: true)
+        let buildPath = testRoot.appendingPathComponent("scratch", isDirectory: true)
+        let appBundleURL = testRoot.appendingPathComponent("会议录音-test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: buildPath, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
         let build = Process()
         build.executableURL = URL(fileURLWithPath: "/bin/bash")
         build.arguments = ["scripts/build-app.sh"]
         build.currentDirectoryURL = projectURL
         build.environment = ProcessInfo.processInfo.environment.merging(
-            ["MEETING_RECORDER_BUILD_PATH": buildPath.path]
+            [
+                "MEETING_RECORDER_BUILD_TESTING": "1",
+                "MEETING_RECORDER_BUILD_TEST_ROOT": testRoot.path,
+                "MEETING_RECORDER_BUILD_PATH": buildPath.path,
+                "MEETING_RECORDER_APP_BUNDLE_PATH": appBundleURL.path,
+            ]
         ) { _, replacement in replacement }
         try build.run()
         build.waitUntilExit()
         XCTAssertEqual(build.terminationStatus, 0, "The release app bundle must build successfully.")
 
-        let buildDate = ISO8601DateFormatter()
-        buildDate.formatOptions = [.withFullDate]
-        let appBundleURL = projectURL
-            .appendingPathComponent("dist", isDirectory: true)
-            .appendingPathComponent("会议录音-\(buildDate.string(from: Date())).app", isDirectory: true)
         let infoURL = appBundleURL.appendingPathComponent("Contents/Info.plist")
         let infoData = try Data(contentsOf: infoURL)
         let info = try XCTUnwrap(
@@ -52,6 +55,63 @@ final class AppLifecycleTests: XCTestCase {
         try validateIcon.run()
         validateIcon.waitUntilExit()
         XCTAssertEqual(validateIcon.terminationStatus, 0, "The bundle icon must be a readable ICNS file.")
+
+        let expectedIconSlots = [
+            "icon_16x16.png": 16,
+            "icon_16x16@2x.png": 32,
+            "icon_32x32.png": 32,
+            "icon_32x32@2x.png": 64,
+            "icon_128x128.png": 128,
+            "icon_128x128@2x.png": 256,
+            "icon_256x256.png": 256,
+            "icon_256x256@2x.png": 512,
+            "icon_512x512.png": 512,
+            "icon_512x512@2x.png": 1024,
+        ]
+        let actualIconSlots = try FileManager.default.contentsOfDirectory(
+            atPath: iconsetURL.path
+        ).sorted()
+        XCTAssertEqual(actualIconSlots, expectedIconSlots.keys.sorted())
+        for (filename, expectedSize) in expectedIconSlots {
+            let image = try XCTUnwrap(
+                NSBitmapImageRep(data: Data(contentsOf: iconsetURL.appendingPathComponent(filename)))
+            )
+            XCTAssertEqual(image.pixelsWide, expectedSize, "Unexpected width for \(filename).")
+            XCTAssertEqual(image.pixelsHigh, expectedSize, "Unexpected height for \(filename).")
+        }
+    }
+
+    func testBuildScriptRejectsTestingOverridesOutsideExplicitTestingMode() throws {
+        let projectURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("meeting-recorder-build-test.\(UUID().uuidString)", isDirectory: true)
+        let buildPath = testRoot.appendingPathComponent("scratch", isDirectory: true)
+        let appBundleURL = testRoot.appendingPathComponent("会议录音-test.app", isDirectory: true)
+        try FileManager.default.createDirectory(at: buildPath, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: testRoot) }
+        let build = Process()
+        build.executableURL = URL(fileURLWithPath: "/bin/bash")
+        build.arguments = ["scripts/build-app.sh"]
+        build.currentDirectoryURL = projectURL
+        build.environment = ProcessInfo.processInfo.environment.merging(
+            [
+                "MEETING_RECORDER_BUILD_TESTING": "0",
+                "MEETING_RECORDER_BUILD_TEST_ROOT": testRoot.path,
+                "MEETING_RECORDER_BUILD_PATH": buildPath.path,
+                "MEETING_RECORDER_APP_BUNDLE_PATH": appBundleURL.path,
+            ]
+        ) { _, replacement in replacement }
+        try build.run()
+        build.waitUntilExit()
+
+        XCTAssertNotEqual(
+            build.terminationStatus,
+            0,
+            "Build-only output overrides must be rejected unless testing mode is explicitly enabled."
+        )
     }
 
     func testProductionCompositionRecordingLeaseBlocksRootRecoveryAndUsesLaunchStore() async throws {
