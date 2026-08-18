@@ -1,5 +1,7 @@
 .DS_Store
 .build/
 dist/
+/录音文件/
+/安装备份/
 .superpowers/
 *.xcuserstate

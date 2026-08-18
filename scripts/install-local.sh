@@ -20,22 +20,42 @@ if [[ "$BUILD_DATE" != [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] ]]; then
 fi
 
 if [[ "$TEST_MODE" == "1" ]]; then
-    TEST_ROOT="${MEETING_RECORDER_TEST_ROOT:-}"
-    [[ -n "$TEST_ROOT" ]] || { print -u2 -- "Test root is required in install testing mode."; exit 70; }
-    TEST_ROOT="${TEST_ROOT:A}"
+    TEST_ROOT_INPUT="${MEETING_RECORDER_TEST_ROOT:-}"
+    [[ -n "$TEST_ROOT_INPUT" ]] || { print -u2 -- "Test root is required in install testing mode."; exit 70; }
+    [[ -d "$TEST_ROOT_INPUT" && ! -L "$TEST_ROOT_INPUT" ]] || {
+        print -u2 -- "Install test root must be an existing non-symlink directory."
+        exit 70
+    }
+    TEST_ROOT="${TEST_ROOT_INPUT:A}"
     TEMP_ROOT="${TMPDIR:-/tmp}"
     TEMP_ROOT="${TEMP_ROOT:A}"
-    if [[ ! -d "$TEST_ROOT" || "$TEST_ROOT" != "$TEMP_ROOT"/meeting-recorder-install-test.* ]]; then
+    if [[ "$TEST_ROOT" != "$TEMP_ROOT"/meeting-recorder-install-test.* ]]; then
         print -u2 -- "Unsafe install test root: $TEST_ROOT"
         exit 70
     fi
 
-    SOURCE_ROOT="${MEETING_RECORDER_SOURCE_ROOT:-$TEST_ROOT/source}"
-    INSTALL_ROOT="${MEETING_RECORDER_INSTALL_ROOT:-$TEST_ROOT/install}"
-    SOURCE_ROOT="${SOURCE_ROOT:A}"
-    INSTALL_ROOT="${INSTALL_ROOT:A}"
-    if [[ "$SOURCE_ROOT" != "$TEST_ROOT"/* || "$INSTALL_ROOT" != "$TEST_ROOT"/* ]]; then
+    SOURCE_ROOT_INPUT="${MEETING_RECORDER_SOURCE_ROOT:-$TEST_ROOT/source}"
+    INSTALL_ROOT_INPUT="${MEETING_RECORDER_INSTALL_ROOT:-$TEST_ROOT/install}"
+    BACKUP_ROOT_INPUT="${MEETING_RECORDER_BACKUP_ROOT:-$TEST_ROOT/backups}"
+    if [[ ! -d "$SOURCE_ROOT_INPUT" || -L "$SOURCE_ROOT_INPUT" ||
+          ! -d "$INSTALL_ROOT_INPUT" || -L "$INSTALL_ROOT_INPUT" ||
+          ! -d "$BACKUP_ROOT_INPUT" || -L "$BACKUP_ROOT_INPUT" ]]; then
+        print -u2 -- "Install test roots must be existing non-symlink directories."
+        exit 70
+    fi
+    SOURCE_ROOT="${SOURCE_ROOT_INPUT:A}"
+    INSTALL_ROOT="${INSTALL_ROOT_INPUT:A}"
+    BACKUP_ROOT="${BACKUP_ROOT_INPUT:A}"
+    if [[ "$SOURCE_ROOT" != "$TEST_ROOT"/* ||
+          "$INSTALL_ROOT" != "$TEST_ROOT"/* ||
+          "$BACKUP_ROOT" != "$TEST_ROOT"/* ]]; then
         print -u2 -- "Install test paths must remain inside: $TEST_ROOT"
+        exit 70
+    fi
+    if [[ "$SOURCE_ROOT" == "$INSTALL_ROOT" ||
+          "$SOURCE_ROOT" == "$BACKUP_ROOT" ||
+          "$INSTALL_ROOT" == "$BACKUP_ROOT" ]]; then
+        print -u2 -- "Install test source, target, and backup roots must be distinct."
         exit 70
     fi
 
@@ -67,6 +87,7 @@ else
     fi
     for override in \
         MEETING_RECORDER_TEST_ROOT MEETING_RECORDER_SOURCE_ROOT MEETING_RECORDER_INSTALL_ROOT \
+        MEETING_RECORDER_BACKUP_ROOT \
         MEETING_RECORDER_DITTO_TOOL MEETING_RECORDER_CODESIGN_TOOL MEETING_RECORDER_OPEN_TOOL \
         MEETING_RECORDER_QUIT_TOOL MEETING_RECORDER_PGREP_TOOL MEETING_RECORDER_PS_TOOL \
         MEETING_RECORDER_SLEEP_TOOL MEETING_RECORDER_MV_TOOL MEETING_RECORDER_QUIT_ATTEMPTS \
@@ -79,6 +100,7 @@ else
 
     SOURCE_ROOT="$PROJECT_DIR/dist"
     INSTALL_ROOT="/Users/alan/Applications"
+    BACKUP_ROOT="/Users/alan/Documents/快速本地录音软件/安装备份"
     DITTO_TOOL="/usr/bin/ditto"
     CODESIGN_TOOL="/usr/bin/codesign"
     OPEN_TOOL="/usr/bin/open"
@@ -115,6 +137,11 @@ if [[ "$TEST_MODE" == "0" && "$TARGET_APP" != "/Users/alan/Applications/会议�
     print -u2 -- "Refusing unexpected production install target: $TARGET_APP"
     exit 65
 fi
+BACKUP_ROOT="${BACKUP_ROOT:A}"
+if [[ "$TEST_MODE" == "0" && "$BACKUP_ROOT" != "/Users/alan/Documents/快速本地录音软件/安装备份" ]]; then
+    print -u2 -- "Refusing unexpected production backup root: $BACKUP_ROOT"
+    exit 65
+fi
 
 # Complete source preflight happens before process quit, backup, or target mutation.
 if [[ ! -d "$SOURCE_APP" ]]; then
@@ -136,12 +163,12 @@ if [[ "$source_bundle_id" != "$BUNDLE_ID" || "$source_ui_element" != "true" ]]; 
     exit 66
 fi
 
-BACKUP_APP="$INSTALL_ROOT/会议录音-backup-$BACKUP_STAMP.app"
-FAILED_APP="$INSTALL_ROOT/会议录音-failed-$BACKUP_STAMP.app"
+BACKUP_APP="$BACKUP_ROOT/会议录音-backup-$BACKUP_STAMP.app.backup"
+FAILED_APP="$BACKUP_ROOT/会议录音-failed-$BACKUP_STAMP.app.backup"
 suffix=2
 while [[ -e "$BACKUP_APP" || -e "$FAILED_APP" ]]; do
-    BACKUP_APP="$INSTALL_ROOT/会议录音-backup-$BACKUP_STAMP-v$suffix.app"
-    FAILED_APP="$INSTALL_ROOT/会议录音-failed-$BACKUP_STAMP-v$suffix.app"
+    BACKUP_APP="$BACKUP_ROOT/会议录音-backup-$BACKUP_STAMP-v$suffix.app.backup"
+    FAILED_APP="$BACKUP_ROOT/会议录音-failed-$BACKUP_STAMP-v$suffix.app.backup"
     (( suffix += 1 ))
 done
 
@@ -157,6 +184,7 @@ if (( DRY_RUN )); then
 fi
 
 /bin/mkdir -p "$INSTALL_ROOT"
+/bin/mkdir -p "$BACKUP_ROOT"
 if [[ -e "$TARGET_APP" && ! -d "$TARGET_APP" ]]; then
     print -u2 -- "Install target exists but is not an app directory: $TARGET_APP"
     exit 67

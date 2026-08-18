@@ -26,6 +26,7 @@ final class AppLifecycleTests: XCTestCase {
                 "MEETING_RECORDER_BUILD_TEST_ROOT": testRoot.path,
                 "MEETING_RECORDER_BUILD_PATH": buildPath.path,
                 "MEETING_RECORDER_APP_BUNDLE_PATH": appBundleURL.path,
+                "MEETING_RECORDER_BUILD_TEST_SIGNING_MODE": "adhoc",
             ]
         ) { _, replacement in replacement }
         try build.run()
@@ -102,6 +103,7 @@ final class AppLifecycleTests: XCTestCase {
                 "MEETING_RECORDER_BUILD_TEST_ROOT": testRoot.path,
                 "MEETING_RECORDER_BUILD_PATH": buildPath.path,
                 "MEETING_RECORDER_APP_BUNDLE_PATH": appBundleURL.path,
+                "MEETING_RECORDER_BUILD_TEST_SIGNING_MODE": "adhoc",
             ]
         ) { _, replacement in replacement }
         try build.run()
@@ -744,6 +746,12 @@ final class InstallScriptIntegrationTests: XCTestCase {
             "old"
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: harness.targetExecutable.path))
+        XCTAssertTrue(harness.backupApp.path.hasSuffix(".app.backup"))
+        XCTAssertEqual(harness.backupApp.deletingLastPathComponent(), harness.backupRoot)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: harness.installRoot.path)
+                .contains { $0.hasSuffix(".app.backup") }
+        )
     }
 
     func testWrongProcessPathIsNeverAskedToQuit() throws {
@@ -793,6 +801,55 @@ final class InstallScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(try harness.targetMarker(), "old")
         XCTAssertFalse(FileManager.default.fileExists(atPath: harness.backupApp.path))
     }
+
+    func testBackupRootOutsideInstallTestRootIsRejectedBeforeMutation() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        let outsideRoot = try InstallScriptHarness.makeTemporaryDirectory(
+            named: "meeting-recorder-install-backup-escape"
+        )
+        defer { try? FileManager.default.removeItem(at: outsideRoot) }
+        harness.environment["MEETING_RECORDER_BACKUP_ROOT"] = outsideRoot.path
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 70, result.output)
+        XCTAssertEqual(try harness.targetMarker(), "old")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: outsideRoot.path).isEmpty)
+    }
+
+    func testInstallOverridesRequireExplicitTestingMode() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        harness.environment["MEETING_RECORDER_INSTALL_TESTING"] = "0"
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 70, result.output)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.targetApp.path))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: harness.backupRoot.path).isEmpty)
+    }
+
+    func testSymlinkBackupRootIsRejectedBeforeMutation() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        let realBackupRoot = harness.root.appendingPathComponent("real-backups", isDirectory: true)
+        let linkedBackupRoot = harness.root.appendingPathComponent("linked-backups", isDirectory: true)
+        try FileManager.default.createDirectory(at: realBackupRoot, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            atPath: linkedBackupRoot.path,
+            withDestinationPath: realBackupRoot.path
+        )
+        harness.environment["MEETING_RECORDER_BACKUP_ROOT"] = linkedBackupRoot.path
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 70, result.output)
+        XCTAssertEqual(try harness.targetMarker(), "old")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: realBackupRoot.path).isEmpty)
+    }
 }
 
 private final class InstallScriptHarness {
@@ -800,6 +857,7 @@ private final class InstallScriptHarness {
     let root: URL
     let sourceRoot: URL
     let installRoot: URL
+    let backupRoot: URL
     let toolsRoot: URL
     let stateRoot: URL
     let sourceApp: URL
@@ -838,14 +896,15 @@ private final class InstallScriptHarness {
             .standardizedFileURL
         sourceRoot = root.appendingPathComponent("source", isDirectory: true)
         installRoot = root.appendingPathComponent("install", isDirectory: true)
+        backupRoot = root.appendingPathComponent("backups", isDirectory: true)
         toolsRoot = root.appendingPathComponent("tools", isDirectory: true)
         stateRoot = root.appendingPathComponent("state", isDirectory: true)
         sourceApp = sourceRoot.appendingPathComponent("会议录音-2026-08-18.app", isDirectory: true)
         targetApp = installRoot.appendingPathComponent("会议录音.app", isDirectory: true)
         targetExecutable = targetApp.appendingPathComponent("Contents/MacOS/MeetingRecorderApp")
-        backupApp = installRoot.appendingPathComponent("会议录音-backup-\(Self.stamp).app")
-        backupAppV2 = installRoot.appendingPathComponent("会议录音-backup-\(Self.stamp)-v2.app")
-        failedApp = installRoot.appendingPathComponent("会议录音-failed-\(Self.stamp).app")
+        backupApp = backupRoot.appendingPathComponent("会议录音-backup-\(Self.stamp).app.backup")
+        backupAppV2 = backupRoot.appendingPathComponent("会议录音-backup-\(Self.stamp)-v2.app.backup")
+        failedApp = backupRoot.appendingPathComponent("会议录音-failed-\(Self.stamp).app.backup")
         failTargetVerificationFlag = stateRoot.appendingPathComponent("fail-target-verification")
         quitCalledFlag = stateRoot.appendingPathComponent("quit-called")
         let testFile = URL(fileURLWithPath: #filePath)
@@ -857,6 +916,7 @@ private final class InstallScriptHarness {
 
         try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: installRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: toolsRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stateRoot, withIntermediateDirectories: true)
         try Self.makeApp(at: sourceApp, marker: "new")
@@ -912,6 +972,7 @@ private final class InstallScriptHarness {
         environment["MEETING_RECORDER_TEST_ROOT"] = root.path
         environment["MEETING_RECORDER_SOURCE_ROOT"] = sourceRoot.path
         environment["MEETING_RECORDER_INSTALL_ROOT"] = installRoot.path
+        environment["MEETING_RECORDER_BACKUP_ROOT"] = backupRoot.path
         environment["MEETING_RECORDER_CODESIGN_TOOL"] = codesign.path
         environment["MEETING_RECORDER_OPEN_TOOL"] = open.path
         environment["MEETING_RECORDER_QUIT_TOOL"] = quit.path
@@ -961,6 +1022,33 @@ private final class InstallScriptHarness {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
+    }
+
+    static func makeTemporaryDirectory(named prefix: String) throws -> URL {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mktemp")
+        process.arguments = [
+            "-d",
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(prefix).XXXXXX")
+                .path,
+        ]
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let path = String(
+                data: output.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8
+              )?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else {
+            throw InstallHarnessError.setup
+        }
+        let canonicalPath = path.hasPrefix("/var/") ? "/private\(path)" : path
+        return URL(fileURLWithPath: canonicalPath, isDirectory: true)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
     }
 
     private static func makeApp(at url: URL, marker: String) throws {
