@@ -79,9 +79,11 @@ public final class RecordingCoordinator: ObservableObject {
                     phase = .recording(active, warning: nil)
                 }
             } catch {
-                resetAudioLevelThrottle()
-                if operationID == operation, phase == .preparing {
-                    phase = .failed(Self.failure(from: error))
+                if operationID == operation {
+                    resetAudioLevelThrottle()
+                    if phase == .preparing {
+                        phase = .failed(Self.failure(from: error))
+                    }
                 }
             }
         case let .recording(active, _):
@@ -90,14 +92,18 @@ public final class RecordingCoordinator: ObservableObject {
             phase = .stopping(active)
             do {
                 _ = try await session.stop()
-                resetAudioLevelThrottle()
-                if operationID == operation, phase == .stopping(active) {
-                    phase = .idle
+                if operationID == operation {
+                    resetAudioLevelThrottle()
+                    if phase == .stopping(active) {
+                        phase = .idle
+                    }
                 }
             } catch {
-                resetAudioLevelThrottle()
-                if operationID == operation, phase == .stopping(active) {
-                    phase = .failed(Self.failure(from: error))
+                if operationID == operation {
+                    resetAudioLevelThrottle()
+                    if phase == .stopping(active) {
+                        phase = .failed(Self.failure(from: error))
+                    }
                 }
             }
         case .preparing, .stopping:

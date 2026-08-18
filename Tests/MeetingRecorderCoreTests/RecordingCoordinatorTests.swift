@@ -125,6 +125,7 @@ final class SessionManagerSpy: RecordingSessionManaging {
     var stopError: Error?
     var suspendStart = false
     var suspendStop = false
+    var suspendedStartCallNumbers: Set<Int> = []
 
     let eventStream: AsyncStream<RecordingSessionEvent>
     private let eventContinuation: AsyncStream<RecordingSessionEvent>.Continuation
@@ -151,7 +152,7 @@ final class SessionManagerSpy: RecordingSessionManaging {
             startedAt: date,
             workingURL: URL(fileURLWithPath: "/tmp/meeting-recording-working.m4a")
         )
-        if suspendStart {
+        if suspendStart || suspendedStartCallNumbers.contains(startCallCount) {
             return try await withCheckedThrowingContinuation { continuation in
                 pendingStart = continuation
             }
@@ -205,6 +206,11 @@ final class SessionManagerSpy: RecordingSessionManaging {
             fileURL: URL(fileURLWithPath: "/tmp/meeting-recording.m4a"),
             recovered: false
         ))
+        pendingStop = nil
+    }
+
+    func finishStop(throwing error: any Error) {
+        pendingStop?.resume(throwing: error)
         pendingStop = nil
     }
 }
@@ -272,6 +278,70 @@ final class RecordingCoordinatorTests: XCTestCase {
         }
         XCTFail("expected stop to be suspended while stopping")
         return false
+    }
+
+    private func failCurrentOperationAndStartNewRecording(
+        session: SessionManagerSpy,
+        coordinator: RecordingCoordinator,
+        failure: RecordingFailure
+    ) async -> ActiveRecording? {
+        session.yield(.failed(failure))
+        await waitForPhase(.failed(failure), coordinator: coordinator)
+        await coordinator.toggleRecording()
+        guard case let .recording(active, warning) = coordinator.phase else {
+            XCTFail("expected replacement recording")
+            return nil
+        }
+        XCTAssertNil(warning)
+        return active
+    }
+
+    private func beginPendingLevelWindow(
+        session: SessionManagerSpy,
+        coordinator: RecordingCoordinator,
+        active: ActiveRecording,
+        levelClock: ManualCoordinatorLevelClock,
+        recorder: AudioLevelPublicationRecorder
+    ) async -> AudioLevels {
+        let leading = AudioLevels(system: 0.11, microphone: 0.22)
+        session.yield(.levels(leading))
+        await waitForAudioPublicationCount(1, recorder: recorder)
+
+        levelClock.advance(milliseconds: 20)
+        let pending = AudioLevels(system: 0.33, microphone: 0.44)
+        let barrier = RecordingFailure(code: .microphone, message: "replacement pending barrier")
+        session.yield(.levels(pending))
+        session.yield(.warning(barrier))
+        await waitForPhase(.recording(active, warning: barrier), coordinator: coordinator)
+        await waitForLevelSleeper(levelClock)
+        XCTAssertEqual(recorder.values, [leading])
+        return leading
+    }
+
+    private func assertStaleCompletionPreservesLevelWindow(
+        session: SessionManagerSpy,
+        coordinator: RecordingCoordinator,
+        active: ActiveRecording,
+        levelClock: ManualCoordinatorLevelClock,
+        recorder: AudioLevelPublicationRecorder,
+        leading: AudioLevels
+    ) async {
+        levelClock.advance(milliseconds: 10)
+        let latest = AudioLevels(system: 0.77, microphone: 0.88)
+        let barrier = RecordingFailure(code: .microphone, message: "post-stale barrier")
+        session.yield(.levels(latest))
+        session.yield(.warning(barrier))
+        await waitForPhase(.recording(active, warning: barrier), coordinator: coordinator)
+
+        XCTAssertEqual(
+            recorder.values,
+            [leading],
+            "a stale operation must not reset the replacement recording's 100ms window"
+        )
+
+        levelClock.advance(milliseconds: 70)
+        await waitForAudioPublicationCount(2, recorder: recorder)
+        XCTAssertEqual(recorder.values, [leading, latest])
     }
 
     func testToggleStartsThenStopsExactlyOnce() async {
@@ -737,6 +807,182 @@ final class RecordingCoordinatorTests: XCTestCase {
         session.finishStop()
         await stopTask.value
         XCTAssertEqual(coordinator.phase, .failed(expected))
+    }
+
+    func testStaleStartSuccessPreservesReplacementRecordingLevelWindow() async {
+        let wallClock = LockedCoordinatorTestClock()
+        let levelClock = ManualCoordinatorLevelClock()
+        let session = SessionManagerSpy()
+        session.suspendedStartCallNumbers = [1]
+        let coordinator = RecordingCoordinator(
+            session: session,
+            now: wallClock.now,
+            levelClock: levelClock
+        )
+        let recorder = AudioLevelPublicationRecorder(coordinator: coordinator)
+        await waitForEventSubscription(session)
+
+        let staleStartTask = Task { await coordinator.toggleRecording() }
+        guard await waitForStartSuspension(session, coordinator) else { return }
+        let failure = RecordingFailure(code: .capture, message: "supersede stale start")
+        guard let active = await failCurrentOperationAndStartNewRecording(
+            session: session,
+            coordinator: coordinator,
+            failure: failure
+        ) else { return }
+        let leading = await beginPendingLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder
+        )
+
+        session.finishStart()
+        await staleStartTask.value
+
+        await assertStaleCompletionPreservesLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder,
+            leading: leading
+        )
+    }
+
+    func testStaleStartErrorPreservesReplacementRecordingLevelWindow() async {
+        let wallClock = LockedCoordinatorTestClock()
+        let levelClock = ManualCoordinatorLevelClock()
+        let session = SessionManagerSpy()
+        session.suspendedStartCallNumbers = [1]
+        let coordinator = RecordingCoordinator(
+            session: session,
+            now: wallClock.now,
+            levelClock: levelClock
+        )
+        let recorder = AudioLevelPublicationRecorder(coordinator: coordinator)
+        await waitForEventSubscription(session)
+
+        let staleStartTask = Task { await coordinator.toggleRecording() }
+        guard await waitForStartSuspension(session, coordinator) else { return }
+        let failure = RecordingFailure(code: .capture, message: "supersede stale start error")
+        guard let active = await failCurrentOperationAndStartNewRecording(
+            session: session,
+            coordinator: coordinator,
+            failure: failure
+        ) else { return }
+        let leading = await beginPendingLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder
+        )
+
+        session.finishStart(throwing: RecordingFailure(
+            code: .capture,
+            message: "stale start finally failed"
+        ))
+        await staleStartTask.value
+
+        await assertStaleCompletionPreservesLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder,
+            leading: leading
+        )
+    }
+
+    func testStaleStopSuccessPreservesReplacementRecordingLevelWindow() async {
+        let wallClock = LockedCoordinatorTestClock()
+        let levelClock = ManualCoordinatorLevelClock()
+        let session = SessionManagerSpy()
+        let coordinator = RecordingCoordinator(
+            session: session,
+            now: wallClock.now,
+            levelClock: levelClock
+        )
+        let recorder = AudioLevelPublicationRecorder(coordinator: coordinator)
+        await coordinator.toggleRecording()
+        await waitForEventSubscription(session)
+        session.suspendStop = true
+
+        let staleStopTask = Task { await coordinator.toggleRecording() }
+        guard await waitForStopSuspension(session, coordinator) else { return }
+        let failure = RecordingFailure(code: .write, message: "supersede stale stop")
+        guard let active = await failCurrentOperationAndStartNewRecording(
+            session: session,
+            coordinator: coordinator,
+            failure: failure
+        ) else { return }
+        let leading = await beginPendingLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder
+        )
+
+        session.finishStop()
+        await staleStopTask.value
+
+        await assertStaleCompletionPreservesLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder,
+            leading: leading
+        )
+    }
+
+    func testStaleStopErrorPreservesReplacementRecordingLevelWindow() async {
+        let wallClock = LockedCoordinatorTestClock()
+        let levelClock = ManualCoordinatorLevelClock()
+        let session = SessionManagerSpy()
+        let coordinator = RecordingCoordinator(
+            session: session,
+            now: wallClock.now,
+            levelClock: levelClock
+        )
+        let recorder = AudioLevelPublicationRecorder(coordinator: coordinator)
+        await coordinator.toggleRecording()
+        await waitForEventSubscription(session)
+        session.suspendStop = true
+
+        let staleStopTask = Task { await coordinator.toggleRecording() }
+        guard await waitForStopSuspension(session, coordinator) else { return }
+        let failure = RecordingFailure(code: .write, message: "supersede stale stop error")
+        guard let active = await failCurrentOperationAndStartNewRecording(
+            session: session,
+            coordinator: coordinator,
+            failure: failure
+        ) else { return }
+        let leading = await beginPendingLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder
+        )
+
+        session.finishStop(throwing: RecordingFailure(
+            code: .write,
+            message: "stale stop finally failed"
+        ))
+        await staleStopTask.value
+
+        await assertStaleCompletionPreservesLevelWindow(
+            session: session,
+            coordinator: coordinator,
+            active: active,
+            levelClock: levelClock,
+            recorder: recorder,
+            leading: leading
+        )
     }
 
     func testStartFailurePreservesRecordingFailure() async {
