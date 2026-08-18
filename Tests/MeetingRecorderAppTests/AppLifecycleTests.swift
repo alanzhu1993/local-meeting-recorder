@@ -685,6 +685,53 @@ private extension CapturePermissionStatus {
 }
 
 final class InstallScriptIntegrationTests: XCTestCase {
+    func testSignalsAfterBackupMoveExitOnceRestoreOldAppAndSkipCopyAndOpen() throws {
+        let expectedStatuses: [(signal: String, status: Int32)] = [
+            ("HUP", 129),
+            ("INT", 130),
+            ("QUIT", 131),
+            ("TERM", 143),
+        ]
+
+        for expected in expectedStatuses {
+            let harness = try InstallScriptHarness()
+            defer { harness.cleanup() }
+            try harness.installOldApp(marker: "old-\(expected.signal)")
+            let outsideMarkers = try InstallScriptHarness.makeTemporaryDirectory(
+                named: "meeting-recorder-install-signal-marker"
+            )
+            defer { try? FileManager.default.removeItem(at: outsideMarkers) }
+            let tools = try harness.makeSignalStageTools(
+                signal: expected.signal,
+                outsideMarkers: outsideMarkers
+            )
+            harness.environment["MEETING_RECORDER_MV_TOOL"] = tools.move.path
+            harness.environment["MEETING_RECORDER_DITTO_TOOL"] = tools.ditto.path
+            harness.environment["MEETING_RECORDER_OPEN_TOOL"] = tools.open.path
+
+            let result = try harness.runSendingSignalAfterBackupMove(
+                expected.signal,
+                outsideMarkers: outsideMarkers
+            )
+
+            XCTAssertEqual(result.status, expected.status, result.output)
+            XCTAssertEqual(try harness.targetMarker(), "old-\(expected.signal)")
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: outsideMarkers.appendingPathComponent("ditto-called").path
+                ),
+                "\(expected.signal) must stop before the copy stage."
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: outsideMarkers.appendingPathComponent("open-called").path
+                ),
+                "\(expected.signal) must stop before the launch stage."
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: harness.backupApp.path))
+        }
+    }
+
     func testDittoPartialFailureRestoresPreviousAppAndPreservesFailedArtifact() throws {
         let harness = try InstallScriptHarness()
         defer { harness.cleanup() }
@@ -850,6 +897,62 @@ final class InstallScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(try harness.targetMarker(), "old")
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: realBackupRoot.path).isEmpty)
     }
+
+    func testFinalTargetSymlinkOutsideInstallRootIsRejectedBeforeMutation() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "outside-old")
+        let outsideRoot = try InstallScriptHarness.makeTemporaryDirectory(
+            named: "meeting-recorder-install-target-symlink"
+        )
+        defer { try? FileManager.default.removeItem(at: outsideRoot) }
+        let outsideApp = outsideRoot.appendingPathComponent("outside.app", isDirectory: true)
+        try FileManager.default.moveItem(at: harness.targetApp, to: outsideApp)
+        try FileManager.default.createSymbolicLink(
+            atPath: harness.targetApp.path,
+            withDestinationPath: outsideApp.path
+        )
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 70, result.output)
+        XCTAssertEqual(
+            try String(contentsOf: outsideApp.appendingPathComponent("marker"), encoding: .utf8),
+            "outside-old"
+        )
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: harness.backupRoot.path).isEmpty
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: harness.openCalledFlag.path))
+    }
+
+    func testFinalSourceSymlinkOutsideSourceRootIsRejectedBeforeMutation() throws {
+        let harness = try InstallScriptHarness()
+        defer { harness.cleanup() }
+        try harness.installOldApp(marker: "old")
+        let outsideRoot = try InstallScriptHarness.makeTemporaryDirectory(
+            named: "meeting-recorder-install-source-symlink"
+        )
+        defer { try? FileManager.default.removeItem(at: outsideRoot) }
+        let outsideApp = outsideRoot.appendingPathComponent("source.app", isDirectory: true)
+        try FileManager.default.moveItem(at: harness.sourceApp, to: outsideApp)
+        try FileManager.default.createSymbolicLink(
+            atPath: harness.sourceApp.path,
+            withDestinationPath: outsideApp.path
+        )
+
+        let result = try harness.run()
+
+        XCTAssertEqual(result.status, 70, result.output)
+        XCTAssertEqual(
+            try String(contentsOf: outsideApp.appendingPathComponent("marker"), encoding: .utf8),
+            "new"
+        )
+        XCTAssertEqual(try harness.targetMarker(), "old")
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: harness.backupRoot.path).isEmpty
+        )
+    }
 }
 
 private final class InstallScriptHarness {
@@ -868,6 +971,7 @@ private final class InstallScriptHarness {
     let failedApp: URL
     let failTargetVerificationFlag: URL
     let quitCalledFlag: URL
+    let openCalledFlag: URL
     let dittoPartialFailure: URL
     let mvRestoreFailure: URL
     let installScript: URL
@@ -907,6 +1011,7 @@ private final class InstallScriptHarness {
         failedApp = backupRoot.appendingPathComponent("会议录音-failed-\(Self.stamp).app.backup")
         failTargetVerificationFlag = stateRoot.appendingPathComponent("fail-target-verification")
         quitCalledFlag = stateRoot.appendingPathComponent("quit-called")
+        openCalledFlag = stateRoot.appendingPathComponent("open-called")
         let testFile = URL(fileURLWithPath: #filePath)
         installScript = testFile
             .deletingLastPathComponent()
@@ -929,7 +1034,7 @@ private final class InstallScriptHarness {
             exit 0
             """)
         let open = toolsRoot.appendingPathComponent("open")
-        try Self.writeTool(open, "#!/bin/zsh\nprint -r -- \"$1\" > '\(stateRoot.appendingPathComponent("open-called").path)'\n")
+        try Self.writeTool(open, "#!/bin/zsh\nprint -r -- \"$1\" > '\(openCalledFlag.path)'\n")
         let quit = toolsRoot.appendingPathComponent("quit")
         try Self.writeTool(quit, "#!/bin/zsh\n: > '\(quitCalledFlag.path)'\n")
         let pgrep = toolsRoot.appendingPathComponent("pgrep")
@@ -1006,6 +1111,79 @@ private final class InstallScriptHarness {
         }
     }
 
+    func makeSignalStageTools(
+        signal: String,
+        outsideMarkers: URL
+    ) throws -> (move: URL, ditto: URL, open: URL) {
+        let move = toolsRoot.appendingPathComponent("move-signal-\(signal)")
+        try Self.writeTool(move, """
+            #!/bin/zsh
+            /bin/mv "$1" "$2"
+            if [[ ! -f '\(outsideMarkers.appendingPathComponent("backup-moved").path)' ]]; then
+                : > '\(outsideMarkers.appendingPathComponent("backup-moved").path)'
+                attempts=0
+                while [[ ! -f '\(outsideMarkers.appendingPathComponent("release-move").path)' ]]; do
+                    (( attempts >= 500 )) && exit 91
+                    /bin/sleep 0.01
+                    (( attempts += 1 ))
+                done
+            fi
+            """)
+        let ditto = toolsRoot.appendingPathComponent("ditto-signal-\(signal)")
+        try Self.writeTool(ditto, """
+            #!/bin/zsh
+            : > '\(outsideMarkers.appendingPathComponent("ditto-called").path)'
+            /usr/bin/ditto "$@"
+            """)
+        let open = toolsRoot.appendingPathComponent("open-signal-\(signal)")
+        try Self.writeTool(open, """
+            #!/bin/zsh
+            : > '\(outsideMarkers.appendingPathComponent("open-called").path)'
+            """)
+        return (move, ditto, open)
+    }
+
+    func runSendingSignalAfterBackupMove(
+        _ signal: String,
+        outsideMarkers: URL
+    ) throws -> (status: Int32, output: String) {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = installScript
+        process.arguments = ["2026-08-18"]
+        process.environment = environment
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+
+        let moved = outsideMarkers.appendingPathComponent("backup-moved")
+        let deadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: moved.path), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard FileManager.default.fileExists(atPath: moved.path) else {
+            process.terminate()
+            process.waitUntilExit()
+            throw InstallHarnessError.signalStageNotReached
+        }
+
+        let sendSignal = Process()
+        sendSignal.executableURL = URL(fileURLWithPath: "/bin/kill")
+        sendSignal.arguments = ["-s", signal, String(process.processIdentifier)]
+        try sendSignal.run()
+        sendSignal.waitUntilExit()
+        guard sendSignal.terminationStatus == 0 else {
+            process.terminate()
+            process.waitUntilExit()
+            throw InstallHarnessError.signalDeliveryFailed
+        }
+        try Data().write(to: outsideMarkers.appendingPathComponent("release-move"))
+
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
     func run() throws -> (status: Int32, output: String) {
         let process = Process()
         let pipe = Pipe()
@@ -1080,6 +1258,8 @@ private final class InstallScriptHarness {
 private enum InstallHarnessError: Error {
     case setup
     case unsafeTarget
+    case signalStageNotReached
+    case signalDeliveryFailed
 }
 
 @MainActor

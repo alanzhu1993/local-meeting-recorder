@@ -122,12 +122,20 @@ if [[ "$QUIT_ATTEMPTS" != <-> || "$QUIT_ATTEMPTS" -lt 1 || "$QUIT_ATTEMPTS" -gt 
     exit 70
 fi
 
-SOURCE_APP="$SOURCE_ROOT/会议录音-$BUILD_DATE.app"
-TARGET_APP="$INSTALL_ROOT/$APP_NAME"
-SOURCE_APP="${SOURCE_APP:A}"
-TARGET_APP="${TARGET_APP:A}"
+SOURCE_APP_INPUT="$SOURCE_ROOT/会议录音-$BUILD_DATE.app"
+TARGET_APP_INPUT="$INSTALL_ROOT/$APP_NAME"
+if [[ -L "$SOURCE_APP_INPUT" || -L "$TARGET_APP_INPUT" ]]; then
+    print -u2 -- "Source and target app paths must not be symbolic links."
+    exit 70
+fi
+SOURCE_APP="${SOURCE_APP_INPUT:A}"
+TARGET_APP="${TARGET_APP_INPUT:A}"
 EXPECTED_TARGET="$INSTALL_ROOT/$APP_NAME"
-EXPECTED_TARGET="${EXPECTED_TARGET:A}"
+
+if [[ "$SOURCE_APP" != "$SOURCE_ROOT"/* || "$TARGET_APP" != "$INSTALL_ROOT"/* ]]; then
+    print -u2 -- "Source and target app paths must remain inside their configured roots."
+    exit 70
+fi
 
 if [[ "$TARGET_APP" != "$EXPECTED_TARGET" ]]; then
     print -u2 -- "Refusing unexpected install target: $TARGET_APP"
@@ -231,36 +239,56 @@ if (( ${#matching_pids} > 0 )); then
 fi
 
 backup_made=0
+backup_move_started=0
 install_succeeded=0
 
 restore_previous_app() {
     local original_status=$?
-    (( install_succeeded )) && return 0
+    local final_status=$original_status
+    local cleanup_failed=0
+    local backup_available=0
+    trap - EXIT HUP INT QUIT TERM
+    (( install_succeeded )) && exit "$final_status"
+    (( final_status == 0 )) && final_status=70
 
     if [[ -e "$TARGET_APP" ]]; then
         if "$MV_TOOL" "$TARGET_APP" "$FAILED_APP"; then
             print -u2 -- "Preserved failed install at: $FAILED_APP"
         else
             print -u2 -- "Could not move failed install; it remains at: $TARGET_APP"
+            cleanup_failed=1
         fi
     fi
 
-    if (( backup_made )); then
+    if (( backup_made )) || { (( backup_move_started )) && [[ -e "$BACKUP_APP" ]]; }; then
+        backup_available=1
+    fi
+    if (( backup_available )); then
         if [[ ! -e "$TARGET_APP" ]] && "$MV_TOOL" "$BACKUP_APP" "$TARGET_APP"; then
             print -u2 -- "Restored previous app after install failure: $TARGET_APP"
         else
             print -u2 -- "Automatic restore could not replace the target; previous app remains safe at: $BACKUP_APP"
+            cleanup_failed=1
         fi
     elif [[ -e "$FAILED_APP" ]]; then
         print -u2 -- "No previous app existed; failed artifact remains at: $FAILED_APP"
     else
         print -u2 -- "No previous app existed; partial target remains at: $TARGET_APP"
     fi
-    return "$original_status"
+    if (( cleanup_failed )); then
+        print -u2 -- "Install rollback was incomplete. Manual remediation is required; inspect $TARGET_APP, $BACKUP_APP, and $FAILED_APP."
+        final_status=70
+    fi
+    exit "$final_status"
 }
-trap restore_previous_app EXIT INT HUP TERM
+trap restore_previous_app EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 131' QUIT
+trap 'exit 143' TERM
 
 if [[ -d "$TARGET_APP" ]]; then
+    backup_move_started=1
     "$MV_TOOL" "$TARGET_APP" "$BACKUP_APP"
     backup_made=1
     print -- "Preserved previous app at: $BACKUP_APP"
@@ -277,6 +305,6 @@ if [[ "$installed_bundle_id" != "$BUNDLE_ID" || "$installed_ui_element" != "true
 fi
 
 install_succeeded=1
-trap - EXIT INT HUP TERM
+trap - EXIT HUP INT QUIT TERM
 "$OPEN_TOOL" "$TARGET_APP"
 print -- "Installed and launched: $TARGET_APP"
