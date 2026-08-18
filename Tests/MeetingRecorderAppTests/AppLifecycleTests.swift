@@ -5,6 +5,55 @@ import XCTest
 
 @MainActor
 final class AppLifecycleTests: XCTestCase {
+    func testReleaseBuildIncludesReadableDeclaredApplicationIcon() throws {
+        let projectURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let buildPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: buildPath) }
+        let build = Process()
+        build.executableURL = URL(fileURLWithPath: "/bin/bash")
+        build.arguments = ["scripts/build-app.sh"]
+        build.currentDirectoryURL = projectURL
+        build.environment = ProcessInfo.processInfo.environment.merging(
+            ["MEETING_RECORDER_BUILD_PATH": buildPath.path]
+        ) { _, replacement in replacement }
+        try build.run()
+        build.waitUntilExit()
+        XCTAssertEqual(build.terminationStatus, 0, "The release app bundle must build successfully.")
+
+        let buildDate = ISO8601DateFormatter()
+        buildDate.formatOptions = [.withFullDate]
+        let appBundleURL = projectURL
+            .appendingPathComponent("dist", isDirectory: true)
+            .appendingPathComponent("会议录音-\(buildDate.string(from: Date())).app", isDirectory: true)
+        let infoURL = appBundleURL.appendingPathComponent("Contents/Info.plist")
+        let infoData = try Data(contentsOf: infoURL)
+        let info = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: infoData, format: nil) as? [String: Any]
+        )
+        let iconFilename = try XCTUnwrap(info["CFBundleIconFile"] as? String)
+        XCTAssertEqual(iconFilename, "AppIcon-2026-08-18.icns")
+
+        let iconURL = appBundleURL
+            .appendingPathComponent("Contents/Resources", isDirectory: true)
+            .appendingPathComponent(iconFilename)
+        let iconData = try Data(contentsOf: iconURL)
+        XCTAssertFalse(iconData.isEmpty, "The declared icon resource must be readable from the built app bundle.")
+
+        let iconsetURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(UUID().uuidString).iconset", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: iconsetURL) }
+        let validateIcon = Process()
+        validateIcon.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+        validateIcon.arguments = ["--convert", "iconset", "--output", iconsetURL.path, iconURL.path]
+        try validateIcon.run()
+        validateIcon.waitUntilExit()
+        XCTAssertEqual(validateIcon.terminationStatus, 0, "The bundle icon must be a readable ICNS file.")
+    }
+
     func testProductionCompositionRecordingLeaseBlocksRootRecoveryAndUsesLaunchStore() async throws {
         let environment = try makeCompositionTestEnvironment()
         defer { environment.cleanup() }

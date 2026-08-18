@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleDisplayName</key>
     <string>会议录音</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon-2026-08-18.icns</string>
     <key>CFBundleExecutable</key>
     <string>MeetingRecorderApp</string>
     <key>CFBundleIdentifier</key>
