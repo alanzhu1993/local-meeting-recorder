@@ -206,11 +206,11 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertFalse(statusItem.button?.accessibilityLabel()?.contains("正在录音") == true)
 
         controller.bind(to: model)
-        XCTAssertEqual(popover.contentSize.height, 370)
+        XCTAssertEqual(popover.contentSize.height, 320)
         model.permissionMessage = "请开启录音权限。"
-        XCTAssertEqual(popover.contentSize.height, 470)
+        XCTAssertEqual(popover.contentSize.height, 416)
         model.permissionMessage = nil
-        XCTAssertEqual(popover.contentSize.height, 370)
+        XCTAssertEqual(popover.contentSize.height, 320)
     }
 
     func testPermissionRequestGrantedOnRecheckStartsExactlyOnce() async {
@@ -226,7 +226,8 @@ final class MenuBarPresentationTests: XCTestCase {
             permissions: permissions,
             phase: { .idle },
             toggle: { toggleCount += 1 },
-            updatePermissionMessage: { messages.append($0) }
+            updatePermissionMessage: { messages.append($0) },
+            notifications: NoopNotificationSpy()
         )
 
         await action.perform()
@@ -249,7 +250,8 @@ final class MenuBarPresentationTests: XCTestCase {
             permissions: permissions,
             phase: { .failed(.init(code: .permission, message: "需要授权")) },
             toggle: { toggleCount += 1 },
-            updatePermissionMessage: { message = $0 }
+            updatePermissionMessage: { message = $0 },
+            notifications: NoopNotificationSpy()
         )
 
         await action.perform()
@@ -272,7 +274,8 @@ final class MenuBarPresentationTests: XCTestCase {
             permissions: permissions,
             phase: { recording },
             toggle: { toggleCount += 1 },
-            updatePermissionMessage: { _ in }
+            updatePermissionMessage: { _ in },
+            notifications: NoopNotificationSpy()
         )
 
         await action.perform()
@@ -739,4 +742,10 @@ private final class LoginItemSpy: LoginItemManaging {
 
 private enum TestError: Error {
     case rejected
+}
+
+private final class NoopNotificationSpy: RecordingNotifying, @unchecked Sendable {
+    func saved(_ recording: SavedRecording) async {}
+    func failed(_ failure: RecordingFailure) async {}
+    func permissionNeeded(_ message: String) async {}
 }

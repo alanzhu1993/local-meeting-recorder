@@ -7,18 +7,21 @@ final class PermissionGatedRecordingAction {
     private let phase: () -> RecordingPhase
     private let toggle: () async -> Void
     private let updatePermissionMessage: (String?) -> Void
+    private let notifications: any RecordingNotifying
     private var requestInFlight = false
 
     init(
         permissions: any PermissionChecking,
         phase: @escaping () -> RecordingPhase,
         toggle: @escaping () async -> Void,
-        updatePermissionMessage: @escaping (String?) -> Void
+        updatePermissionMessage: @escaping (String?) -> Void,
+        notifications: any RecordingNotifying
     ) {
         self.permissions = permissions
         self.phase = phase
         self.toggle = toggle
         self.updatePermissionMessage = updatePermissionMessage
+        self.notifications = notifications
     }
 
     func perform() async {
@@ -43,6 +46,7 @@ final class PermissionGatedRecordingAction {
             let rechecked = await permissions.currentStatus()
             guard rechecked.isGranted else {
                 updatePermissionMessage(rechecked.userMessage)
+                await notifications.permissionNeeded(rechecked.userMessage)
                 return
             }
 
@@ -365,7 +369,8 @@ final class ProductionCompositionRoot {
             permissions: permissions,
             phase: { coordinator.phase },
             toggle: { await coordinator.toggleRecording() },
-            updatePermissionMessage: permissionMessageRelay.publish
+            updatePermissionMessage: permissionMessageRelay.publish,
+            notifications: notifications
         )
         let recordingEntrypoint = RecordingActionEntrypoint(action: recordingAction)
         let recordingHandler: @Sendable () -> Void = {

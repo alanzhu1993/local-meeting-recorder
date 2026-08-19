@@ -191,14 +191,14 @@ final class MenuBarViewModel: ObservableObject {
         warningText: String?
     ) -> CGFloat {
         if isRecovering || hasRecoveryFeedback || permissionMessage != nil || warningText != nil {
-            return 470
+            return 416
         }
         switch phase {
-        case .idle: return 370
-        case .preparing: return 340
-        case .recording: return 430
-        case .stopping: return 370
-        case .failed: return 430
+        case .idle: return 320
+        case .preparing: return 308
+        case .recording: return 376
+        case .stopping: return 320
+        case .failed: return 376
         }
     }
 
@@ -263,12 +263,12 @@ struct MenuBarView: View {
             header
             statusSummary
                 .padding(.horizontal, 16)
-                .padding(.top, 14)
+                .padding(.top, 12)
                 .padding(.bottom, 10)
             ScrollView {
                 secondaryContent
                     .padding(.horizontal, 16)
-                    .padding(.bottom, 16)
+                    .padding(.bottom, 14)
             }
         }
         .frame(width: 292, height: model.preferredHeight)
@@ -276,7 +276,7 @@ struct MenuBarView: View {
     }
 
     private var secondaryContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             if model.isRecovering {
                 notice(
                     title: "正在恢复录音",
@@ -404,7 +404,7 @@ struct MenuBarView: View {
                 .foregroundStyle(AppColors.ink2)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(10)
+        .padding(9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AppColors.warningSurface)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(AppColors.warningBorder, lineWidth: 1))
@@ -464,7 +464,7 @@ struct MenuBarView: View {
             .font(.system(size: 13))
             .foregroundStyle(AppColors.ink2)
             .padding(.horizontal, 11)
-            .frame(height: 38)
+            .frame(height: 36)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

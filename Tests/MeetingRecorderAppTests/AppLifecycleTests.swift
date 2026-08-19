@@ -270,12 +270,13 @@ final class AppLifecycleTests: XCTestCase {
             statuses: [.denied, .granted, .denied]
         )
         let capture = CompositionBlockingCapture()
+        let notifications = CompositionNotificationSpy()
         let composition = ProductionCompositionRoot(
             settingsStore: environment.settingsStore,
             permissions: permissions,
             capture: capture,
             sleep: CompositionSleepSpy(),
-            notifications: CompositionNotificationSpy(),
+            notifications: notifications,
             sessionFactory: makeCompositionTestSession,
             recoveryFactory: makeCompositionTestRecovery
         )
@@ -299,6 +300,42 @@ final class AppLifecycleTests: XCTestCase {
         )
         let captureStartCallCount = await capture.startCallCount
         XCTAssertEqual(captureStartCallCount, 0)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(
+            at: environment.rootURL,
+            includingPropertiesForKeys: nil
+        ).isEmpty)
+    }
+
+    func testPermissionDeniedAfterRequestSendsSystemNotification() async throws {
+        let environment = try makeCompositionTestEnvironment()
+        defer { environment.cleanup() }
+        let permissions = CompositionPermissionSpy(statuses: [.denied, .denied])
+        let capture = CompositionBlockingCapture()
+        let notifications = CompositionNotificationSpy()
+        let composition = ProductionCompositionRoot(
+            settingsStore: environment.settingsStore,
+            permissions: permissions,
+            capture: capture,
+            sleep: CompositionSleepSpy(),
+            notifications: notifications,
+            sessionFactory: makeCompositionTestSession,
+            recoveryFactory: makeCompositionTestRecovery
+        )
+
+        composition.menuRecordingHandler()
+        let sessionCheckObserved = await permissions.waitForCurrentCount(2)
+        XCTAssertTrue(sessionCheckObserved)
+        await notifications.waitForPermissionNotification()
+
+        let permissionMessages = await notifications.permissionMessages
+        XCTAssertEqual(permissionMessages.count, 1, "权限被拒时必须发送系统通知引导用户")
+        XCTAssertTrue(
+            permissionMessages[0].contains("屏幕与系统音频录制"),
+            "通知应说明缺失的屏幕录制权限：\(permissionMessages.first ?? "")"
+        )
+
+        let captureStartCallCount = await capture.startCallCount
+        XCTAssertEqual(captureStartCallCount, 0, "权限仍未授权时不应开始录音")
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(
             at: environment.rootURL,
             includingPropertiesForKeys: nil
@@ -1389,6 +1426,7 @@ private final class LifecycleSleepSpy: SleepPreventing, @unchecked Sendable {
 private actor LifecycleNotificationSpy: RecordingNotifying {
     func saved(_ recording: SavedRecording) async {}
     func failed(_ failure: RecordingFailure) async {}
+    func permissionNeeded(_ message: String) async {}
 }
 
 private actor CompositionPermissionSpy: PermissionChecking {
@@ -1488,8 +1526,20 @@ private final class CompositionSleepSpy: SleepPreventing, @unchecked Sendable {
 }
 
 private actor CompositionNotificationSpy: RecordingNotifying {
+    private let permissionDelivered = AsyncStream<Void>.makeStream()
+    private(set) var permissionMessages: [String] = []
+
     func saved(_ recording: SavedRecording) async {}
     func failed(_ failure: RecordingFailure) async {}
+    func permissionNeeded(_ message: String) async {
+        permissionMessages.append(message)
+        permissionDelivered.continuation.yield()
+    }
+
+    func waitForPermissionNotification() async {
+        var iterator = permissionDelivered.stream.makeAsyncIterator()
+        _ = await iterator.next()
+    }
 }
 
 private final class CompositionSignal: @unchecked Sendable {

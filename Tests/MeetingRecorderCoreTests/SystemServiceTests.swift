@@ -57,6 +57,20 @@ final class SystemServiceTests: XCTestCase {
         XCTAssertFalse(options.contains(.sound))
     }
 
+    func testPermissionNeededNotificationUsesDedicatedTitleAndBody() async {
+        let backend = NotificationBackendStub()
+        let service = NotificationService(backend: backend)
+        let message = "请在系统设置 > 隐私与安全性中开启「会议录音」的：屏幕与系统音频录制。"
+
+        await service.permissionNeeded(message)
+
+        XCTAssertEqual(backend.notifications.count, 1)
+        XCTAssertEqual(backend.notifications[0].title, "需要录音权限")
+        XCTAssertEqual(backend.notifications[0].body, message)
+        XCTAssertNil(backend.notifications[0].fileURL)
+        XCTAssertFalse(backend.notifications[0].playsSound)
+    }
+
     func testLoginItemMapsRequiresApprovalToActionableError() {
         let backend = LoginItemBackendStub(status: .requiresApproval)
         let service = LoginItemService(backend: backend)

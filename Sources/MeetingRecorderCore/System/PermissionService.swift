@@ -25,7 +25,12 @@ public struct CapturePermissionStatus: Equatable, Sendable {
 
     public var userMessage: String {
         guard !missing.isEmpty else { return "权限已就绪" }
-        return "请在系统设置 > 隐私与安全性中开启：" + missing.map(\.displayName).joined(separator: "、") + "。"
+        var message = "请在系统设置 > 隐私与安全性中开启「会议录音」的："
+            + missing.map(\.displayName).joined(separator: "、") + "。"
+        if missing.contains(.systemAudio) {
+            message += "开启屏幕录制后需要退出并重新打开本应用。"
+        }
+        return message
     }
 }
 

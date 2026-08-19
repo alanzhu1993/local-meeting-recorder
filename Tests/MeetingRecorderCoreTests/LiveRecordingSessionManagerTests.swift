@@ -798,6 +798,10 @@ private actor SessionNotificationSpy: RecordingNotifying {
         failedCallCount += 1
         calls.append("notification.failed")
     }
+
+    func permissionNeeded(_ message: String) async {
+        calls.append("notification.permissionNeeded")
+    }
 }
 
 private final class SessionConverterSpy: AudioSampleConverting, @unchecked Sendable {

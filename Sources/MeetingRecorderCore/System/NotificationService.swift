@@ -5,6 +5,7 @@ import UserNotifications
 public protocol RecordingNotifying: Sendable {
     func saved(_ recording: SavedRecording) async
     func failed(_ failure: RecordingFailure) async
+    func permissionNeeded(_ message: String) async
 }
 
 public struct RecordingNotification: Equatable, Sendable {
@@ -74,6 +75,16 @@ public final class NotificationService: RecordingNotifying, @unchecked Sendable 
             identifier: "failed-\(UUID().uuidString)",
             title: "录音失败",
             body: failure.message,
+            fileURL: nil,
+            playsSound: false
+        ))
+    }
+
+    public func permissionNeeded(_ message: String) async {
+        await backend.deliver(RecordingNotification(
+            identifier: "permission-needed-\(UUID().uuidString)",
+            title: "需要录音权限",
+            body: message,
             fileURL: nil,
             playsSound: false
         ))

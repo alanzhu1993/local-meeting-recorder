@@ -13,7 +13,24 @@ final class PermissionServiceTests: XCTestCase {
         let status = await service.currentStatus()
 
         XCTAssertEqual(status.missing, [.systemAudio, .microphone])
-        XCTAssertEqual(status.userMessage, "请在系统设置 > 隐私与安全性中开启：屏幕与系统音频录制、麦克风。")
+        XCTAssertEqual(
+            status.userMessage,
+            "请在系统设置 > 隐私与安全性中开启「会议录音」的：屏幕与系统音频录制、麦克风。开启屏幕录制后需要退出并重新打开本应用。"
+        )
+    }
+
+    func testMicrophoneOnlyMessageOmitsRestartGuidance() async {
+        let service = PermissionService(
+            screenAccess: { true },
+            requestScreenAccess: {},
+            microphoneStatus: { .denied },
+            requestMicrophoneAccess: {}
+        )
+
+        let status = await service.currentStatus()
+
+        XCTAssertEqual(status.missing, [.microphone])
+        XCTAssertEqual(status.userMessage, "请在系统设置 > 隐私与安全性中开启「会议录音」的：麦克风。")
     }
 
     func testRequestQueriesActualStatusAgainInsteadOfTrustingRequestReturnValue() async {
