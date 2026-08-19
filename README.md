@@ -30,13 +30,42 @@ macOS 菜单栏会议录音工具：一键录制屏幕画面 + 系统音频 + �
 # 2. 构建当天版本（产出 dist/会议录音-YYYY-MM-DD.app，带正式本地签名）
 ./scripts/build-app.sh
 
-# 3. 安装到 /Users/alan/Applications（自动备份旧版本）
+# 3. 安装到 ~/Applications（自动备份旧版本到 项目根/安装备份）
 ./scripts/install-local.sh <YYYY-MM-DD>
 ```
 
 日常更新只需重复步骤 2、3。由于采用稳定签名，更新后无需重新授权系统权限。
 
-> 说明：构建与安装脚本中的路径、钥匙串、登录启动项均针对本机用户 `alan` 预置。迁移到其他机器时需相应调整脚本中的路径常量。
+> 脚本现已使用 `$HOME` 与项目相对路径，clone 到任何机器都可直接运行，无需改动路径常量。安装目标默认 `~/Applications`（请确保该目录存在，或编辑脚本中的 `INSTALL_ROOT` 改为 `/Applications`）。
+
+## 为他人：从源码构建并运行
+
+本仓库提供的是**源码**，不附带预编译好的 `.app`。原因：本项目采用「本地自签名」—— app 锚定**构建者自己机器**上的自签证书。如果你直接拿别人（例如 alan）构建好的 `.app`，在你的 Mac 上会被 Gatekeeper 以「无法验证开发者」拦截，因为那份证书不在你的系统信任里。
+
+因此，其他人使用本软件的正确方式是**在自己机器上从源码构建**：
+
+1. 准备环境：macOS 15 或更高，安装 Xcode 16+（含命令行工具），并安装 git。
+2. 克隆仓库：
+   ```bash
+   git clone https://github.com/alanzhu1993/local-meeting-recorder
+   cd local-meeting-recorder
+   ```
+3. 一次性初始化你自己的本地签名身份（在你的登录钥匙串创建受限自签证书，并写入 pinned receipt）：
+   ```bash
+   ./scripts/setup-local-signing.sh
+   ```
+4. 构建并签名（产出 `dist/会议录音-YYYY-MM-DD.app`，使用你自己的证书）：
+   ```bash
+   ./scripts/build-app.sh
+   ```
+5. 安装到 `~/Applications`（旧版本自动备份到项目根目录下的 `安装备份/`）：
+   ```bash
+   ./scripts/install-local.sh
+   ```
+6. 在「系统设置 → 隐私与安全性」中授予：**屏幕与系统音频录制**、**麦克风** 权限给「会议录音」。
+7. 从启动台 / Applications 打开「会议录音」，菜单栏会出现录音图标，点按或按 `⌃⌥R` 即可开始。
+
+> 想分发「开箱即用」的预编译 app 给他人？需要改用 Apple Developer Program 的 **Developer ID** 证书签名（每年 $99），并做公证（notarization）。这超出当前仓库范围；如有需要可另行实现。
 
 ## 测试
 

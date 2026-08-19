@@ -99,8 +99,8 @@ else
     done
 
     SOURCE_ROOT="$PROJECT_DIR/dist"
-    INSTALL_ROOT="/Users/alan/Applications"
-    BACKUP_ROOT="/Users/alan/Documents/快速本地录音软件/安装备份"
+    INSTALL_ROOT="$HOME/Applications"
+    BACKUP_ROOT="$PROJECT_DIR/安装备份"
     DITTO_TOOL="/usr/bin/ditto"
     CODESIGN_TOOL="/usr/bin/codesign"
     OPEN_TOOL="/usr/bin/open"
@@ -141,12 +141,12 @@ if [[ "$TARGET_APP" != "$EXPECTED_TARGET" ]]; then
     print -u2 -- "Refusing unexpected install target: $TARGET_APP"
     exit 65
 fi
-if [[ "$TEST_MODE" == "0" && "$TARGET_APP" != "/Users/alan/Applications/会议录音.app" ]]; then
+if [[ "$TEST_MODE" == "0" && "$TARGET_APP" != "$HOME/Applications/会议录音.app" ]]; then
     print -u2 -- "Refusing unexpected production install target: $TARGET_APP"
     exit 65
 fi
 BACKUP_ROOT="${BACKUP_ROOT:A}"
-if [[ "$TEST_MODE" == "0" && "$BACKUP_ROOT" != "/Users/alan/Documents/快速本地录音软件/安装备份" ]]; then
+if [[ "$TEST_MODE" == "0" && "$BACKUP_ROOT" != "$PROJECT_DIR/安装备份" ]]; then
     print -u2 -- "Refusing unexpected production backup root: $BACKUP_ROOT"
     exit 65
 fi

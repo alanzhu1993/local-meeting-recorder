@@ -5,8 +5,8 @@ umask 077
 
 IDENTITY_NAME="会议录音 Local Signing 2026-08-18"
 ROOT_NAME="会议录音 Local Signing Root 2026-08-18"
-PRODUCTION_KEYCHAIN="/Users/alan/Library/Keychains/login.keychain-db"
-PRODUCTION_RECEIPT_DIRECTORY="/Users/alan/Library/Application Support/MeetingRecorder"
+PRODUCTION_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+PRODUCTION_RECEIPT_DIRECTORY="$HOME/Library/Application Support/MeetingRecorder"
 PRODUCTION_RECEIPT_PATH="$PRODUCTION_RECEIPT_DIRECTORY/local-signing-receipt-v1"
 TESTING_MODE="${MEETING_RECORDER_SIGNING_SETUP_TESTING:-0}"
 TEST_ROOT="${MEETING_RECORDER_SIGNING_TEST_ROOT:-}"
@@ -205,9 +205,9 @@ ensure_receipt_directory() {
     if [[ ! -e "$RECEIPT_DIRECTORY" ]]; then
         [[ "$TESTING_MODE" == "0" ]] \
             || { echo "setup-local-signing.sh: testing receipt directory disappeared" >&2; return 66; }
-        [[ "$(dirname "$RECEIPT_DIRECTORY")" == "/Users/alan/Library/Application Support" ]] \
+        [[ "$(dirname "$RECEIPT_DIRECTORY")" == "$HOME/Library/Application Support" ]] \
             || { echo "setup-local-signing.sh: refused unexpected receipt directory" >&2; return 66; }
-        [[ "$(canonical_directory "$(dirname "$RECEIPT_DIRECTORY")")" == "/Users/alan/Library/Application Support" ]] \
+        [[ "$(canonical_directory "$(dirname "$RECEIPT_DIRECTORY")")" == "$HOME/Library/Application Support" ]] \
             || { echo "setup-local-signing.sh: receipt parent directory is unsafe" >&2; return 66; }
         if /bin/mkdir "$RECEIPT_DIRECTORY"; then
             receipt_directory_created=1
