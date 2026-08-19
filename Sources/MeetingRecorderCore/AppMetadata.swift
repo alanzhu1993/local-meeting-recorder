@@ -14,6 +14,7 @@ public struct HotkeyDescriptor: Codable, Equatable, Sendable {
 
 public enum AppMetadata {
     public static let bundleIdentifier = "com.alan.local-meeting-recorder"
+    public static let buildIdentifier = "2026-08-19.1"
     public static let defaultRecordingRoot = URL(
         fileURLWithPath: "/Users/alan/Documents/快速本地录音软件/录音文件",
         isDirectory: true
