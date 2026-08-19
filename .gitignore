@@ -4,4 +4,5 @@ dist/
 /录音文件/
 /安装备份/
 .superpowers/
+.workbuddy/
 *.xcuserstate
